@@ -1,5 +1,13 @@
 # KiPSel
 
+<p align="center">
+  <img src="docs/assets/kipfel_main.jpg" alt="Kipfel - VRChat 3D Model" width="320" />
+  <br>
+  <em>项目名称取自 VRChat 虚拟形象 <strong>Kipfel</strong>（キプフェル / <a href="https://booth.pm/ja/items/5813187">もち山金魚</a>）🐾</em>
+</p>
+
+---
+
 通过 QQ 私聊（AstrBot ADMIN）远程驱动本机 pi TUI 的轻量桥接项目。
 
 > **状态说明**：三层代码均已实现并通过各自的单元测试：controller（Node `node:test`，12/12）、TUI extension core（Node `--experimental-strip-types`，9/9）、AstrBot 插件纯逻辑（Python `unittest`，43/43）。controller ↔ extension ↔ QQ 的真实端到端链路尚未完成验收，标注为「待验证」。
