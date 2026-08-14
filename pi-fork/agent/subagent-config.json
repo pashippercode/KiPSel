@@ -1,0 +1,4 @@
+{
+  "defaultModel": "111/deepseek-v4-flash",
+  "promptOptimizerModel": "111/deepseek-v4-flash"
+}

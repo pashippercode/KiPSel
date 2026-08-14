@@ -1,0 +1,83 @@
+{
+  "packages": [
+    "../../Projects/pi_pilot/extension"
+  ],
+  "lastChangelogVersion": "0.84.1",
+  "theme": "dark",
+  "defaultProvider": "111",
+  "defaultModel": "deepseek-v4-pro",
+  "enabledModels": [
+    "shuzhipic/gpt-5.6-sol",
+    "shuzhipic/gpt-5.6-terra",
+    "shuzhipic/gpt-5.5",
+    "shuzhipic/deepseek-v4-flash-free",
+    "shuzhipic/laguna-s-2.1-free",
+    "lavenda/gpt-5.6-sol",
+    "lavenda/gpt-5.6-terra",
+    "lavenda/laguna-s-2.1-free",
+    "lavenda/zen-deepseek-v4-flash",
+    "shuzhipic/kimi-k3-free",
+    "shuzhipic/kimi-k2.7-code-highspeed",
+    "lavenda/kimi-k3",
+    "lavenda/zen-mimo-v2.5",
+    "lavenda/deepseek-v4-flash",
+    "111/gpt-5.6-luna",
+    "sol/gpt-5.6-sol",
+    "lmm/gpt-5.6-sol",
+    "111/deepseek-v4-pro",
+    "111/deepseek-v4-flash"
+  ],
+  "tuiMode": "regular",
+  "defaultThinkingLevel": "max",
+  "externalEditor": "code --wait",
+  "defaultProjectTrust": "ask",
+  "collapseChangelog": true,
+  "enableInstallTelemetry": false,
+  "autocompleteMaxVisible": 8,
+  "editorPaddingX": 1,
+  "outputPad": 1,
+  "doubleEscapeAction": "tree",
+  "treeFilterMode": "no-tools",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 24576,
+    "keepRecentTokens": 32000
+  },
+  "branchSummary": {
+    "reserveTokens": 16384,
+    "skipPrompt": false
+  },
+  "retry": {
+    "enabled": true,
+    "maxRetries": 4,
+    "baseDelayMs": 1500,
+    "provider": {
+      "timeoutMs": 900000,
+      "maxRetries": 0,
+      "maxRetryDelayMs": 30000
+    }
+  },
+  "steeringMode": "one-at-a-time",
+  "followUpMode": "one-at-a-time",
+  "transport": "auto",
+  "httpIdleTimeoutMs": 600000,
+  "terminal": {
+    "showImages": true,
+    "imageWidthCells": 50,
+    "clearOnShrink": false
+  },
+  "images": {
+    "autoResize": true,
+    "blockImages": false
+  },
+  "npmCommand": [
+    "/home/xubuntu/.local/node22/node-v22.20.0-linux-x64/bin/npm"
+  ],
+  "markdown": {
+    "codeBlockIndent": "  ",
+    "mermaid": "final"
+  },
+  "showCacheMissNotices": false,
+  "fullscreenScrollbar": "auto",
+  "hideThinkingBlock": false
+}
