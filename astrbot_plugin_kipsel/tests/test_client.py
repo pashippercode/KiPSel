@@ -51,6 +51,19 @@ class ValidateControllerUrlTest(unittest.TestCase):
             with self.subTest(raw=raw):
                 with self.assertRaises(ValueError):
                     validate_controller_url(raw)
+    def test_rejects_parser_bypass_forms(self) -> None:
+        for raw in (
+            "http://127.0.0.1@8.8.8.8:8787",  # userinfo masks public host
+            "http://8.8.8.8@127.0.0.1:8787",  # userinfo masks allowed host
+            "http://010.0.0.1:8787",  # leading-zero octet
+            "http://2130706433:8787",  # decimal integer form of 127.0.0.1
+            "http://[::ffff:127.0.0.1]:8787",  # IPv4-mapped IPv6
+            "http://[::ffff:808:808]:8787",  # IPv4-mapped IPv6, public
+            "http:\\127.0.0.1:8787",  # backslash separator
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    validate_controller_url(raw)
 
 
 class ControllerClientValidationTest(unittest.TestCase):
