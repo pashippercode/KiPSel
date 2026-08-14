@@ -1,0 +1,64 @@
+# Node.js
+node_modules/
+*.tsbuildinfo
+*.js.map
+.eslintcache
+.prettiercache
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test and coverage output
+coverage/
+.coverage
+htmlcov/
+.test-results/
+
+# Logs and editor files
+logs/
+*.log
+*.log.*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Runtime configuration and credentials
+.env
+.env.*
+!.env.example
+state/
+runtime/
+*.state.json
+*.runtime.json
+config.local.*
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+
+# Temporary queue/image payloads
+tmp/
+temp/
+*.tmp
+*.temp
+*.part
+
+# Backups
+*.bak
+*.backup
+*.orig
+*.rej
+
+# Keep distributable examples/templates
+!*.example

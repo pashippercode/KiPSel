@@ -1,0 +1,46 @@
+{
+  "controller_url": {
+    "type": "string",
+    "description": "KiPSel controller 的 HTTP 地址（仅非公网 IPv4）",
+    "hint": "必须是非公网字面 IPv4 且带显式端口（loopback / RFC1918 私网 / Tailscale CGNAT 100.64.0.0/10），形如 http://192.168.x.y:8787；拒绝域名、IPv6、公网与链路本地地址，不接受路径、代理或重定向。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "controller_bearer": {
+    "type": "string",
+    "description": "Controller Bearer 凭据",
+    "hint": "敏感配置。仅在部署端填写，不要发送到聊天、日志或源码仓库。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "queue_limit_per_alias": {
+    "type": "int",
+    "description": "每个 alias 的内存等待队列上限",
+    "default": 20,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
+  },
+  "queue_ttl_minutes": {
+    "type": "int",
+    "description": "尚未提交任务的内存存活时间（分钟）",
+    "default": 30,
+    "slider": {
+      "min": 1,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "max_job_wait_minutes": {
+    "type": "int",
+    "description": "已提交任务等待结果的最长时间（分钟），超时后放弃并释放队列",
+    "default": 120,
+    "slider": {
+      "min": 10,
+      "max": 240,
+      "step": 10
+    }
+  }
+}

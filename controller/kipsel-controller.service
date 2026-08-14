@@ -1,0 +1,21 @@
+# Install as ~/.config/systemd/user/kipsel-controller.service after validation.
+
+[Unit]
+Description=KiPSel controller for visible pi TUI sessions
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/KiPSel/controller
+Environment=KIPSEL_CONFIG=%h/.config/kipsel/controller.json
+Environment=DISPLAY=:0.0
+Environment=XAUTHORITY=%h/.Xauthority
+ExecStart=%h/.local/node22/node-v22.20.0-linux-x64/bin/node server.mjs
+Restart=on-failure
+RestartSec=3
+# Keep detached controller-owned xterm/pi sessions alive when only the controller stops.
+KillMode=process
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

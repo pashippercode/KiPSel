@@ -1,0 +1,8 @@
+name: astrbot_plugin_kipsel
+display_name: KiPSel
+
+desc: 由 AstrBot ADMIN 私聊管理本机可见 pi TUI 会话的轻量桥接插件。
+version: 0.1.1
+author: KiPSel contributors
+repo: "https://github.com/pashippercode/astrbot_plugin_kipsel"
+astrbot_version: ">=4.26,<5"
