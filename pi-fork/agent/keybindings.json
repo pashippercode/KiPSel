@@ -1,0 +1,8 @@
+{
+  "tui.editor.historyPrevious": "ctrl+up",
+  "tui.editor.historyNext": "ctrl+down",
+  "app.session.new": "f2",
+  "app.session.tree": "f3",
+  "app.session.fork": "f4",
+  "app.session.resume": "f5"
+}

@@ -72,6 +72,7 @@ QQ 私聊 ──AstrBot ADMIN 插件──▶ 本机 Node 22 controller ──�
 astrbot_plugin_kipsel/   # AstrBot 插件（层 1）：main.py 命令入口、queueing.py 内存 FIFO、client.py controller 客户端、media.py 纯内存图片读取
 controller/              # Node 22 controller（层 2）：server.mjs、registry.mjs、server.test.mjs、systemd 模板
 tui-extension/           # pi -e 桥接扩展（层 3）：core.ts（纯核心，可独立测试）、index.ts（pi 运行时入口）
+pi-fork/                 # 本机 pi 定制层发行包（见 pi-fork/README.md）：extensions/prompts/agents/knowledge + install.sh
 ```
 
 ## 安装（AstrBot 插件）
