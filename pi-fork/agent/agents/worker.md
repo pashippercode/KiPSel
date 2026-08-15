@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose subagent with full capabilities, isolated context (write/edit only after approval)
-model: 111/deepseek-v4-flash
+model: 111/gpt-5.6-luna
 tools: read, bash, edit, write, grep, find, ls, deliver
 ---
 

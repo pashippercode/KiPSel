@@ -15,12 +15,6 @@ You are pi, an AI coding assistant running on the user's home machine (xubuntu-p
 - Launch vision sessions with `piv` (= `pi --model lavenda/zen-mimo-v2.5`) or `pivs` (resume), defined in `~/.bashrc.pi`.
 - As of 2026-08-08 the `gpt-5.6-sol`/`gpt-5.6-terra` channels are quota-limited (upstream 402 via zen-proxy on racknerd 100.105.91.125, resets ~22:33 CST); use `zen-mimo-v2.5` for image tasks meanwhile.
 
-## PiPilot remote control (mobile)
-- PiPilot bridge (Source Hub) runs on this machine, port 9377 (WebSocket), token in `~/Projects/pi_pilot/bridge/config.json`.
-- Desktop relay extension is installed; run `/reload` in the pi TUI to appear on mobile.
-- Mobile app connects to `ws://100.114.108.120:9377` (Tailscale) with the mobile token.
-- Bridge repo: `~/Projects/pi_pilot` (bridge/ Node service, extension/ relay). Start with `cd ~/Projects/pi_pilot/bridge && npm start`.
-
 ## Node/runtime
 - Node 22.20.0 at `~/.local/node22/node-v22.20.0-linux-x64/bin` (system node is v18 — do not use for pi).
 - pi installed at `~/.local/npm-prefix` (bin: `~/.local/npm-prefix/bin/pi`), version 0.84.1.

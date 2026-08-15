@@ -46,6 +46,8 @@ config.local.*
 *.sqlite
 *.sqlite3
 *.db
+# PiPilot runtime state (deprecated 废案)
+pipilot/
 
 # Temporary queue/image payloads
 tmp/

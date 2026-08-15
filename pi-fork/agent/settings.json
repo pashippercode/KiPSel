@@ -1,9 +1,6 @@
 {
-  "packages": [
-    "../../Projects/pi_pilot/extension"
-  ],
   "lastChangelogVersion": "0.84.1",
-  "theme": "dark",
+  "theme": "kipfel",
   "defaultProvider": "111",
   "defaultModel": "deepseek-v4-pro",
   "enabledModels": [

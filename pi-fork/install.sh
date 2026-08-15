@@ -83,6 +83,7 @@ copy_tree() {
 copy_tree "extensions" "always"
 copy_tree "prompts" "always"
 copy_tree "agents" "always"
+copy_tree "themes" "always"
 copy_tree "knowledge" "if-missing"
 copy_file "$SRC_DIR/AGENTS.md" "always"
 copy_file "$SRC_DIR/APPEND_SYSTEM.md" "always"

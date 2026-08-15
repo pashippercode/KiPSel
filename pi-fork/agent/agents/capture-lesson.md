@@ -1,6 +1,7 @@
 ---
 name: capture-lesson
 description: Capture verified workflow lessons into ~/.pi/agent/knowledge/<scope>.md (write-only, compact append)
+model: 111/gpt-5.6-luna
 tools: read, bash, write, edit, deliver
 ---
 
