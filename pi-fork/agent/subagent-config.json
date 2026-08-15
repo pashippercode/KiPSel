@@ -1,4 +1,4 @@
 {
-  "defaultModel": "111/deepseek-v4-flash",
-  "promptOptimizerModel": "111/deepseek-v4-flash"
+  "defaultModel": "111/gpt-5.6-luna",
+  "promptOptimizerModel": "111/gpt-5.6-luna"
 }

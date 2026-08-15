@@ -14,6 +14,8 @@
        └─ 根配置        AGENTS.md、APPEND_SYSTEM.md、keybindings.json、subagent-config.json、settings.json
 ```
 
+> **旗舰特色**：workflow 模式（prompts/work.md + workflow-audit 五相位门控）是本定制层的核心——先勘察、再计划、批准后执行、审查、验证、沉淀。
+
 ## 定制层能力一览
 
 | 扩展 | 作用 |
@@ -27,8 +29,10 @@
 | `git-checkpoint.ts` | 每轮 git stash 检查点，供 /fork 恢复 |
 | `locatrix-guard/` | locatrix 仓库专用守卫（chart.txt 等） |
 | `model-manage/` | 模型配置管理命令 |
+| `themes/kipfel.json` | Kipfel 橙棕主题：51 键完整主题（accent 橙 `#d9822b`、棕色边框、暖白文字），settings.json `"theme": "kipfel"` 启用 |
+| `kipfel-ui/` | Kipfel 像素画启动 header（`setHeader`）+ Kipfel 风味 working message；全程 try/catch 防御：渲染异常回退为简版单行标题，注册失败则保留内置 header |
 
-子代理模型：`111/deepseek-v4-flash`（各 agent frontmatter + `subagent-config.json` defaultModel）；提示词优化器模型：`subagent-config.json` 的 `promptOptimizerModel`（独立可选，每次调用可用 `model` 参数覆盖）。
+子代理模型：`111/gpt-5.6-luna`（各 agent frontmatter + `subagent-config.json` defaultModel）；提示词优化器模型：`subagent-config.json` 的 `promptOptimizerModel`（独立可选，每次调用可用 `model` 参数覆盖）。
 
 ## 安装 / 更新
 
@@ -38,6 +42,7 @@
 ./install.sh --force    # 覆盖全部文件
 ./install.sh --dry-run  # 只看将要执行的操作
 ```
+> 注意：`settings.json` 与 `subagent-config.json` 是 if-missing 策略；已有安装需 `./install.sh --force` 才会应用本次主题/模型变更（--force 同时会覆盖 knowledge/，请先确认备份）。
 
 安装后在 pi TUI 里执行 `/reload`。被覆盖的文件会先备份到 `~/.pi/agent.backup.<时间戳>/`，回滚即把备份拷回 `~/.pi/agent/`。
 
@@ -57,5 +62,5 @@
 
 ## 版本
 
-- 定制层版本：0.1.0
+- 定制层版本：0.2.0
 - 目标 pi 版本：0.84.1

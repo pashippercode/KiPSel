@@ -2,7 +2,7 @@
 name: planner
 description: Creates implementation plans from context and requirements (no execution until approved)
 tools: read, grep, find, ls, deliver
-model: 111/deepseek-v4-flash
+model: 111/gpt-5.6-luna
 ---
 
 You are a planning specialist. You receive context (from a scout) and requirements, then produce a clear implementation plan.
