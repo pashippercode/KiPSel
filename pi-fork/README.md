@@ -20,21 +20,28 @@
 
 | 扩展 | 作用 |
 |---|---|
-| `subagent/` | `subagent` 工具：单任务/并行/链式委托，每次调用独立 pi 进程冷启动；每任务记录 input/output/cacheRead/cost；`subagent_set_model` 会话级模型重路由；`optimize_prompt` 提示词优化环节（独立可选模型）+ `optimizePrompt` 委托集成；子代理投递管线 |
+| `subagent/` | `subagent` 工具：单任务/并行/链式委托与 detached background jobs；后台任务立即返回 job id，完成时 follow-up，可用 `subagent_jobs` 查询、`subagent_cancel` 取消；每次调用独立 pi 进程冷启动；并行任务支持 scope/readOnly，重叠变更范围自动串行；每任务记录 input/output/cacheRead/cost；`subagent_set_model` 支持 Luna 别名会话级模型重路由；`optimize_prompt` 提示词优化环节（独立可选模型）+ `optimizePrompt` 委托集成；子代理投递管线 |
 | `subagent-deliver/` | `deliver` 工具：子代理主动向主会话投递 blocker/发现/提问（spool 文件 → 主会话 `pi.sendMessage`，urgent 触发 follow-up 轮） |
-| `workflow-audit/` | 五相位门控（plan/active/review/verify/capture）+ 只读命令白名单 + 受保护路径 + git 变更放行根；**active 相位 = 已批准**（ask 模式免逐条确认，危险/受保护/git 仍硬拦截） |
-| `anchored-standard/` | DSH 风格 bootstrap：前 N 轮只暴露 shell+read 的省 token 工具裁剪；透传 deliver/optimize_prompt 及编排器工作流工具（subagent/audit_set_phase/update_goal 等） |
+| `workflow-audit/` | 五相位门控（plan/active/review/verify/capture）+ 只读命令白名单 + 受保护路径 + git 变更放行根；**llm 模式 = 真审查**（调用 `reviewModel`，`/audit-reviewer` 可见可切换，status 显示 reviewer，fail-closed）；ask 的 active = 已批准；危险/受保护路径仍硬拦截 |
+| `anchored-standard/` | DSH 风格 bootstrap：前 N 轮只暴露 shell+read 的省 token 工具裁剪；透传 deliver/optimize_prompt、todo_write、subagent_jobs/subagent_cancel 及编排器工作流工具（subagent/audit_set_phase/update_goal 等） |
 | `plan-mode/` | 只读计划模式：写工具禁用 + bash 白名单 + Plan: 步骤提取与进度跟踪 |
-| `productivity/` | 会话目标 /goal、token 预算、`llm_query`、指标状态栏；**goal → LLM 截断锚点**：active goal 存在时接管 compaction，注入目标锚定指令（Codex 风格），`update_goal` 支持程序化 goal 自举 |
+| `productivity/` | 会话目标 /goal、token 预算、单次顺序化 `llm_query`、指标状态栏；默认查询上限 4096 tokens；**goal → LLM 截断锚点**：active goal 存在时接管 compaction，注入目标锚定指令（Codex 风格），`update_goal` 支持程序化 goal 自举 |
 | `git-checkpoint.ts` | 每轮 git stash 检查点，供 /fork 恢复 |
 | `locatrix-guard/` | locatrix 仓库专用守卫（chart.txt 等） |
-| `model-manage/` | 模型配置管理命令 |
+| `model-manage/` | 模型配置管理命令；apiKey 仅保存为 `$NAME`/`${NAME}` 环境变量引用，不执行配置内 shell 命令 |
 | `themes/kipfel.json` | Kipfel 橙棕主题：51 键完整主题（accent 橙 `#d9822b`、棕色边框、暖白文字），settings.json `"theme": "kipfel"` 启用 |
 | `kipfel-ui/` | Kipfel 像素画启动 header（`setHeader`）+ Kipfel 风味 working message；全程 try/catch 防御：渲染异常回退为简版单行标题，注册失败则保留内置 header |
+| `claude-status-imitating.ts` | 通用 Claude Code 风格 working 指示器（不注册 tool/command，不接入 QQ/controller 监测）。按当前工具推断动作并带上对象：`grep foo.*` → `Discerning foo.*...`，`read a.ts` → `Perusing a.ts...`，思考期仅动词。活动时覆盖 kipfel-ui 的静态揉面文案，空闲后恢复默认 |
 
-子代理模型：`111/gpt-5.6-luna`（各 agent frontmatter + `subagent-config.json` defaultModel）；提示词优化器模型：`subagent-config.json` 的 `promptOptimizerModel`（独立可选，每次调用可用 `model` 参数覆盖）。
+子代理模型：`111/gpt-5.6-luna`（各 agent frontmatter + `subagent-config.json` defaultModel）；`luna`、`lavenda/luna`、`111/luna`、`gpt-5.6-luna` 会解析为 `111/gpt-5.6-luna`。提示词优化器模型：`subagent-config.json` 的 `promptOptimizerModel`（独立可选，每次调用可用 `model` 参数覆盖）。
 
-## 安装 / 更新
+### 异步子代理调度的架构效果
+
+- 主代理只负责创建 job、继续当前任务；子代理进程在独立 AbortController 下运行，完成后通过 follow-up 回传。
+- scope scheduler 仍负责重叠写范围串行，异步不会绕过现有安全门。
+- `subagent_jobs` / `subagent_cancel` 提供最小控制面；父 pi 会话关闭时取消未完成任务。
+- job registry 当前是进程内内存状态，不提供跨会话恢复；若需要持久化队列，应由外部 controller 接管。
+
 
 ```bash
 ./install.sh            # 增量安装：extensions/prompts/agents/AGENTS.md/APPEND_SYSTEM.md/keybindings.json 总是覆盖

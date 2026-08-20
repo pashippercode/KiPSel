@@ -8,7 +8,7 @@
  *   4. 模式差异：
  *      - auto：越权即 block，不打扰用户；
  *      - ask ：越权弹确认；同一 scope 记住 "always"；
- *      - llm ：最严格的 auto（越权即 block，并要求后续 orchestrator 的 reviewer 环节；本扩展不调模型）。
+ *      - llm ：对越权操作调用审查模型（subagent-config.json reviewModel，/audit-reviewer 可切换），可见（status + notify），失败则拒绝。
  *   5. 会话持久化：mode / phase / approvedScopes 经 pi.appendEntry("workflow-audit", ...)。
  *
  * 交互：/audit-mode         —— 打开三档选择
@@ -24,6 +24,7 @@ import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:p
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { isReadOnlyShellCommand } from "./utils.ts";
 
 type AuditMode = "auto" | "llm" | "ask";
 type Phase = "plan" | "active" | "review" | "verify" | "capture";
@@ -32,14 +33,59 @@ const SESSION_KEY = "workflow-audit";
 const PHASES: readonly Phase[] = ["plan", "active", "review", "verify", "capture"] as const;
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const AGENT_DIR = getAgentDir();
+const SUBAGENT_CONFIG_FILE = join(AGENT_DIR, "subagent-config.json");
+const LLM_REVIEW_TIMEOUT_MS = 20_000;
+const LLM_REVIEW_SYSTEM = [
+	"You are the workflow-audit reviewer for a coding-agent session.",
+	"Decide allow or deny for ONE proposed tool call.",
+	"Never allow: rm -rf, sudo, chmod 777, mkfs, dd of=/dev, git reset --hard, git clean -f.",
+	"Never allow writes to auth.json, .git internals, .env, or other protected secrets.",
+	"git add/commit/push/status is fine inside the user's own project roots.",
+	"Prefer allow for ordinary coding work: tests, builds, package scripts, file edits in the project, git in the project.",
+	"Deny escapes, credential theft, destructive system changes, or commands unrelated to the stated task.",
+	'Reply with JSON only: {"decision":"allow"|"deny","reason":"<short>"}',
+].join("\n");
+
+function readReviewModelFromDisk(): string | undefined {
+	try {
+		const parsed = JSON.parse(readFileSync(SUBAGENT_CONFIG_FILE, "utf8")) as { reviewModel?: unknown };
+		return typeof parsed.reviewModel === "string" && parsed.reviewModel.trim() ? parsed.reviewModel.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function writeReviewModelToDisk(model: string | undefined): void {
+	let config: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(readFileSync(SUBAGENT_CONFIG_FILE, "utf8")) as unknown;
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) config = parsed as Record<string, unknown>;
+	} catch {
+		/* missing */
+	}
+	config.reviewModel = model ?? null;
+	writeFileSync(SUBAGENT_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function parseLlmDecision(text: string): { decision: "allow" | "deny"; reason: string } | undefined {
+	const match = text.match(/\{[\s\S]*\}/);
+	if (!match) return undefined;
+	try {
+		const parsed = JSON.parse(match[0]) as { decision?: unknown; reason?: unknown };
+		if (parsed.decision !== "allow" && parsed.decision !== "deny") return undefined;
+		return { decision: parsed.decision, reason: typeof parsed.reason === "string" && parsed.reason.trim() ? parsed.reason.trim() : parsed.decision };
+	} catch {
+		return undefined;
+	}
+}
 
 /** phase → 允许的工具集合（白名单；不在白名单的工具将被门禁逻辑处理） */
 const PHASE_TOOLS: Record<Phase, ReadonlySet<string>> = {
-	plan: new Set(["read", "bash", "grep", "find", "ls", "subagent", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "llm_query", "deliver", "optimize_prompt"]),
-	active: new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "llm_query", "deliver", "optimize_prompt"]),
-	review: new Set(["read", "bash", "grep", "find", "ls", "subagent", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "llm_query", "deliver", "optimize_prompt"]),
-	verify: new Set(["read", "bash", "grep", "find", "ls", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "llm_query", "deliver", "optimize_prompt"]),
-	capture: new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "llm_query", "deliver", "optimize_prompt"]),
+	plan: new Set(["read", "bash", "grep", "find", "ls", "subagent", "subagent_jobs", "subagent_cancel", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "todo_write", "workflow", "llm_query", "deliver", "optimize_prompt", "web_search", "web_fetch", "fetch_content", "source_check"]),
+	active: new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "subagent_jobs", "subagent_cancel", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "todo_write", "workflow", "llm_query", "deliver", "optimize_prompt", "web_search", "web_fetch", "fetch_content", "source_check"]),
+	review: new Set(["read", "bash", "grep", "find", "ls", "subagent", "subagent_jobs", "subagent_cancel", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "todo_write", "workflow", "llm_query", "deliver", "optimize_prompt", "web_search", "web_fetch", "fetch_content", "source_check"]),
+	verify: new Set(["read", "bash", "grep", "find", "ls", "subagent", "subagent_jobs", "subagent_cancel", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "todo_write", "workflow", "llm_query", "deliver", "optimize_prompt", "web_search", "web_fetch", "fetch_content", "source_check"]),
+	capture: new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "subagent", "subagent_jobs", "subagent_cancel", "audit_set_phase", "subagent_set_model", "get_goal", "update_goal", "todo_write", "workflow", "llm_query", "deliver", "optimize_prompt", "web_search", "web_fetch", "fetch_content", "source_check"]),
 };
 
 function normalizeAuditPath(input: string): string {
@@ -129,39 +175,6 @@ function isGitMutation(input: unknown): boolean {
 	);
 }
 
-const READ_ONLY_COMMANDS = new Set([
-	"basename",
-	"cat",
-	"cmp",
-	"cut",
-	"date",
-	"df",
-	"diff",
-	"dirname",
-	"du",
-	"echo",
-	"file",
-	"grep",
-	"head",
-	"id",
-	"jq",
-	"ls",
-	"md5sum",
-	"pwd",
-	"readlink",
-	"realpath",
-	"rg",
-	"sha256sum",
-	"stat",
-	"tail",
-	"tree",
-	"tr",
-	"uname",
-	"uniq",
-	"wc",
-	"whoami",
-]);
-
 // 用户批准的 git 变更放行白名单（2026-08-14，KiPSel 开源发布）：仅这两个项目根
 // 目录下允许 git add/commit/push 等变更子命令；其余仓库维持拦截。.git 路径写保护不受影响。
 const GIT_MUTATION_ALLOWED_ROOTS: readonly string[] = [
@@ -208,36 +221,6 @@ function isGitMutationAllowed(command: unknown, cwd: string): boolean {
 	}
 }
 
-function isReadOnlyShellCommand(input: unknown): boolean {
-	if (typeof input !== "string" || !input.trim()) return false;
-	// This is intentionally not a shell parser: reject quoting/escaping plus expansion, redirection,
-	// backgrounding, heredocs and multiline input. Complex commands require active+ask confirmation.
-	if (/[<>&`$'"\\\r\n]/.test(input)) return false;
-	const commands = input.split(/\|\||[;|]/).map((part) => part.trim()).filter(Boolean);
-	if (commands.length === 0) return false;
-	return commands.every((command) => {
-		if (/^set\s+-[a-z]+$/i.test(command)) return true;
-		if (/^command\s+-v\s+[\w+-]+$/i.test(command)) return true;
-		const match = command.match(/^([\w+-]+)/);
-		if (!match) return false;
-		const executable = match[1];
-		if (executable === "git") {
-			return (
-				/^git\s+(?:cat-file|describe|diff|log|ls-files|ls-tree|name-rev|rev-parse|show|status)(?:\s|$)/i.test(command) &&
-				!/\s(?:--output(?:=|\s)|--ext-diff\b|--textconv\b)/i.test(command)
-			);
-		}
-		if (executable === "find") {
-			return !/\s-(?:delete|exec|execdir|fls|fprint|fprintf|ok|okdir)(?:\s|$)/i.test(command);
-		}
-		if ((executable === "rg" || executable === "grep") && /\s--(?:pre|pre-glob)(?:[=\s]|$)/i.test(command)) return false;
-		if (executable === "tree" && /\s(?:-[^\s]*o[^\s]*|--output(?:\s|=|$))/i.test(command)) return false;
-		if (executable === "file" && /\s(?:-[^\s]*C[^\s]*|--compile)(?:\s|$)/i.test(command)) return false;
-		if (executable === "date" && /\s(?:-[^\s]*s[^\s]*|--set)(?:\s|=|$)/i.test(command)) return false;
-		return READ_ONLY_COMMANDS.has(executable);
-	});
-}
-
 function mentionsProtectedPath(input: unknown): boolean {
 	return (
 		typeof input === "string" &&
@@ -264,9 +247,15 @@ export default function workflowAudit(pi: ExtensionAPI): void {
 	let planAwaitingApproval = false;
 	let flagMode: AuditMode | undefined;
 
-	const persist = () => pi.appendEntry(SESSION_KEY, { mode: state.mode, phase: state.phase, scopes: state.scopes });
+	const persist = () =>
+		pi.appendEntry(SESSION_KEY, { mode: state.mode, phase: state.phase, scopes: state.scopes, reviewModel: state.reviewModel });
 	const isPhase = (value: unknown): value is Phase => typeof value === "string" && (PHASES as readonly string[]).includes(value);
 	const isMode = (value: unknown): value is AuditMode => value === "auto" || value === "llm" || value === "ask";
+	const llmAllowCache = new Map<string, boolean>();
+
+	function currentReviewer(ctx: ExtensionContext): string {
+		return state.reviewModel || readReviewModelFromDisk() || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "pi-default");
+	}
 
 	function restore(ctx: ExtensionContext): void {
 		state.mode = "ask";
@@ -372,6 +361,113 @@ export default function workflowAudit(pi: ExtensionAPI): void {
 		},
 	});
 
+	// ── 统一工作流工具（收敛 goal/todo/plan/phase 的 4 个分散工具为 1 个 action 工具）─────
+	// 替代 get_goal / update_goal / todo_write / audit_set_phase（旧工具仍注册以保持兼容，
+	// 但编排器与 prompts 应优先使用 workflow(action=...)）。
+	// goal/todo 逻辑委托给 productivity / anchored-standard（同注册表覆盖注册，后注册生效）。
+	const todoStore: { todos: Array<{ content: string; status: string }> } = { todos: [] };
+
+	pi.registerTool({
+		name: "workflow",
+		label: "Workflow",
+		description:
+			"Unified workflow state tool. One entry for goal anchor, todo checklist, plan phase, and plan status. " +
+			"Use instead of the legacy get_goal / update_goal / todo_write / audit_set_phase tools.",
+		promptSnippet: "Manage goal, todo checklist, and workflow phase from one tool",
+		promptGuidelines: [
+			"workflow(action=goal_set) anchors the session goal (compaction anchor); call once per task.",
+			"workflow(action=todo_write) replaces the ENTIRE todo list; keep items small and observable.",
+			"workflow(action=phase_set) switches workflow-audit phase; plan → active still requires immediately preceding user approval.",
+			"workflow(action=status) returns a compact summary of goal + todos + current phase.",
+		],
+		parameters: Type.Object({
+			action: Type.String({
+				description: "One of: goal_get, goal_set, todo_read, todo_write, phase_set, status",
+			}),
+			objective: Type.Optional(Type.String({ minLength: 1, maxLength: 4_000, description: "goal_set: goal text (resets counters; status → active)" })),
+			goalStatus: Type.Optional(Type.String({ description: "goal_set: active | blocked | complete" })),
+			note: Type.Optional(Type.String({ description: "goal_set: evidence / blocker note" })),
+			todos: Type.Optional(
+				Type.Array(
+					Type.Object({
+						content: Type.String({ minLength: 1 }),
+						status: Type.String({ description: "pending | in_progress | completed" }),
+					}),
+				),
+			),
+			phase: Type.Optional(Type.String({ description: `phase_set: one of ${PHASES.join(", ")}` })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			switch (String(params.action).trim()) {
+				// ── phase ────────────────────────────────────────────────────
+				case "phase_set": {
+					const p = String(params.phase ?? "").trim() as Phase;
+					if (!isPhase(p)) {
+						return { content: [{ type: "text", text: `Invalid phase "${params.phase}". Valid: ${PHASES.join(", ")}` }], details: {} };
+					}
+					if (!canToolTransition(p)) {
+						return {
+							content: [{ type: "text", text: `Denied phase transition ${state.phase} → ${p}. plan → active requires an immediately preceding user approval.` }],
+							details: {},
+						};
+					}
+					state.phase = p;
+					if (p === "active") {
+						activeApprovedThisRun = false;
+						planAwaitingApproval = false;
+					}
+					persist();
+					status(ctx);
+					return { content: [{ type: "text", text: `phase → ${state.phase}` }], details: {} };
+				}
+				// ── todo ─────────────────────────────────────────────────────
+				case "todo_write": {
+					if (!Array.isArray(params.todos)) {
+						return { content: [{ type: "text", text: "todo_write requires `todos` array." }], details: {} };
+					}
+					todoStore.todos = params.todos.map((t) => ({ content: String(t.content), status: String(t.status) }));
+					return { content: [{ type: "text", text: JSON.stringify({ todos: todoStore.todos }, null, 2) }], details: {} };
+				}
+				case "todo_read": {
+					return { content: [{ type: "text", text: JSON.stringify({ todos: todoStore.todos }, null, 2) }], details: {} };
+				}
+				// ── goal（委托 productivity 的 get_goal / update_goal）────────
+				case "goal_get":
+				case "goal_set": {
+					// 说明：goal 状态由 productivity 扩展持有，本工具不重复实现；
+					// 编排器调用 goal_get/goal_set 时直接转发到 productivity 的工具（经注册表覆盖注册）。
+					// 此处仅占位返回指引——实际实现见 productivity/index.ts 的 get_goal / update_goal。
+					return {
+						content: [
+							{
+								type: "text",
+								text: `goal_${params.action === "goal_get" ? "get" : "set"}: use the dedicated productivity tool. ` +
+									"This unified entry exists so the orchestrator has one tool name to remember; " +
+									"the productivity extension registers get_goal/update_goal which remain authoritative.",
+							},
+						],
+						details: {},
+					};
+				}
+				// ── status ──────────────────────────────────────────────────
+				case "status": {
+					const lines = [
+						`phase: ${state.phase}`,
+						`mode: ${state.mode}`,
+						`todos: ${todoStore.todos.length ? `${todoStore.todos.filter((t) => t.status === "completed").length}/${todoStore.todos.length} completed` : "none"}`,
+						`goal: managed by productivity extension (use workflow goal_get / goal_set)`,
+					];
+					return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+				}
+				default:
+					return {
+						content: [{ type: "text", text: `Unknown action "${params.action}". Valid: goal_get, goal_set, todo_read, todo_write, phase_set, status` }],
+						details: {},
+					};
+			}
+		},
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		const prompt = typeof event.prompt === "string" ? event.prompt.trim() : "";
 		activeApprovedThisRun =
@@ -407,13 +503,15 @@ export default function workflowAudit(pi: ExtensionAPI): void {
 			}
 			if (!isReadOnlyShellCommand(command)) {
 				const mode = effectiveMode(ctx);
-				if (state.phase !== "active") {
+				if (mode === "llm") {
+					const verdict = await reviewWithLlm(ctx, { tool: "bash", input });
+					if (!verdict.allow) {
+						return { block: true, reason: `workflow-audit llm deny: ${verdict.reason}` };
+					}
+				} else if (state.phase !== "active") {
 					return { block: true, reason: `workflow-audit: non-read-only shell command forbidden in phase=${state.phase} (mode=${mode}); use structured tools or active+ask approval` };
-				}
-				// active 相位 = 用户已批准执行（计划审批通过或 /audit-phase 显式切换），
-				// 普通非只读命令不再逐条确认；危险命令/受保护路径/git 变更在上方硬拦截。
-				if (mode === "auto" || mode === "llm") {
-					return { block: true, reason: `workflow-audit: non-read-only shell command blocked in phase=active (mode=${mode}; no interactive approval channel)` };
+				} else if (mode === "auto") {
+					return { block: true, reason: `workflow-audit: non-read-only shell command blocked in phase=active (mode=auto)` };
 				}
 			}
 		}
@@ -444,6 +542,116 @@ export default function workflowAudit(pi: ExtensionAPI): void {
 		}
 
 		// 4) ask 模式下，非 active 相位的高风险写改按 scope 记忆确认；active 相位视为已批准
+		if (effectiveMode(ctx) === "ask" && state.phase !== "active" && (tool === "edit" || tool === "write" || tool === "subagent")) {
+			const key = scopeKey(tool, input);
+			if (state.scopes[key] !== "always") {
+				const choice = await ctx.ui.select(`允许该操作？\n${key}`, ["仅本次", "本会话始终", "拒绝"]);
+				if (choice !== "仅本次" && choice !== "本会话始终") {
+					return { block: true, reason: "workflow-audit: denied by user (ask)" };
+				}
+				if (choice === "本会话始终") {
+					state.scopes[key] = "always";
+					persist();
+				}
+			}
+		}
+
+		return undefined;
+	});
+
+	pi.on("user_bash", async (event, ctx) => {
+		const command = event.command;
+		const protectedOrDangerous = isDangerousCommand(command) || isGitMutation(command) || mentionsProtectedPath(command);
+		const nonReadOnly = !isReadOnlyShellCommand(command);
+		let blocked = protectedOrDangerous || (state.phase !== "active" && nonReadOnly);
+		if (!blocked && nonReadOnly) {
+			const mode = effectiveMode(ctx);
+			if (state.phase === "active") {
+				// active = 已批准，不逐条确认（危险/受保护/git 已在上方硬拦）
+			} else if (mode !== "ask") {
+				blocked = true;
+			} else {
+				blocked = !(await ctx.ui.confirm("Audit user shell command?", command));
+			}
+		}
+		if (!blocked) return;
+		return {
+			result: {
+				output: `workflow-audit: shell command blocked in phase=${state.phase}`,
+				exitCode: 1,
+				cancelled: false,
+				truncated: false,
+			},
+		};
+	});
+}
+rotected(input.path, ctx.cwd)) {
+					return { block: true, reason: `workflow-audit: protected path ${String(input.path)}` };
+				}
+				if (state.phase === "capture" && !isCapturePath(input.path, ctx.cwd)) {
+					return { block: true, reason: `workflow-audit: capture phase only permits writes under ~/.pi/agent/knowledge (${String(input.path)})` };
+				}
+			} catch {
+				return { block: true, reason: `workflow-audit: invalid or unresolvable path ${String(input.path)}` };
+			}
+		}
+
+		// 3) phase 白名单
+		if (!PHASE_TOOLS[state.phase].has(tool)) {
+			const m = effectiveMode(ctx);
+			if (m === "auto" || m === "llm") {
+				return { block: true, reason: `workflow-audit: tool "${tool}" forbidden in phase=${state.phase} (mode=${m})` };
+			}
+			const ok = await ctx.ui.confirm("Audit approve?", `phase=${state.phase}\ntool=${tool}\nscope=${scopeKey(tool, input)}`);
+			if (!ok) return { block: true, reason: "workflow-audit: denied by user (ask)" };
+			return undefined;
+		}
+
+		// 4) ask 模式下，非 active 相位的高风险写改按 scope 记忆确认；active 相位视为已批准
+		if (effectiveMode(ctx) === "ask" && state.phase !== "active" && (tool === "edit" || tool === "write" || tool === "subagent")) {
+			const key = scopeKey(tool, input);
+			if (state.scopes[key] !== "always") {
+				const choice = await ctx.ui.select(`允许该操作？\n${key}`, ["仅本次", "本会话始终", "拒绝"]);
+				if (choice !== "仅本次" && choice !== "本会话始终") {
+					return { block: true, reason: "workflow-audit: denied by user (ask)" };
+				}
+				if (choice === "本会话始终") {
+					state.scopes[key] = "always";
+					persist();
+				}
+			}
+		}
+
+		return undefined;
+	});
+
+	pi.on("user_bash", async (event, ctx) => {
+		const command = event.command;
+		const protectedOrDangerous = isDangerousCommand(command) || isGitMutation(command) || mentionsProtectedPath(command);
+		const nonReadOnly = !isReadOnlyShellCommand(command);
+		let blocked = protectedOrDangerous || (state.phase !== "active" && nonReadOnly);
+		if (!blocked && nonReadOnly) {
+			const mode = effectiveMode(ctx);
+			if (state.phase === "active") {
+				// active = 已批准，不逐条确认（危险/受保护/git 已在上方硬拦）
+			} else if (mode !== "ask") {
+				blocked = true;
+			} else {
+				blocked = !(await ctx.ui.confirm("Audit user shell command?", command));
+			}
+		}
+		if (!blocked) return;
+		return {
+			result: {
+				output: `workflow-audit: shell command blocked in phase=${state.phase}`,
+				exitCode: 1,
+				cancelled: false,
+				truncated: false,
+			},
+		};
+	});
+}
+相位的高风险写改按 scope 记忆确认；active 相位视为已批准
 		if (effectiveMode(ctx) === "ask" && state.phase !== "active" && (tool === "edit" || tool === "write" || tool === "subagent")) {
 			const key = scopeKey(tool, input);
 			if (state.scopes[key] !== "always") {
