@@ -21,11 +21,11 @@
  */
 
 import * as fs from "node:fs";
-import { execSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { isSecretReference, resolveSecretReference } from "./secret-ref.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -169,7 +169,7 @@ function writeModelsFile(data: ModelsFile): void {
 // Masking / validation
 // ---------------------------------------------------------------------------
 
-/** Never show apiKey literals in the TUI: env refs -> $***, literals -> ***len. */
+/** Never show apiKey references or resolved values in the TUI: env refs -> $***. */
 function maskApiKey(key: string | undefined): string {
 	if (key === undefined || key === "") return "(未设置)";
 	if (key.startsWith("$")) return "$***";
@@ -194,20 +194,9 @@ function truncateText(text: string, maxLength: number): string {
 	return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-/** Resolve an apiKey reference only when it is needed at runtime. */
+/** Resolve an external environment reference only when it is needed at runtime. */
 export function resolveApiKey(key: string | undefined): string | undefined {
-	if (!key) return undefined;
-	const envMatch = key.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/) ?? key.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
-	if (envMatch) return process.env[envMatch[1]] || undefined;
-	if (key.startsWith("!")) {
-		try {
-			const output = execSync(key.slice(1), { encoding: "utf8" }).trim();
-			return output || undefined;
-		} catch {
-			throw new Error("API Key 命令执行失败");
-		}
-	}
-	return key;
+	return resolveSecretReference(key);
 }
 
 interface UpstreamModel {
@@ -404,6 +393,7 @@ function validateProvider(id: string, cfg: ProviderConfig): string | null {
 	} catch {
 		return `baseUrl 不是合法的 URL：${cfg.baseUrl}`;
 	}
+	if (cfg.apiKey && !isSecretReference(cfg.apiKey)) return "apiKey 必须使用外部环境引用（$NAME 或 ${NAME}），不能保存字面量或命令";
 	if (cfg.api && !(SUPPORTED_APIS as readonly string[]).includes(cfg.api)) {
 		return `不支持的 api：${cfg.api}（支持：${SUPPORTED_APIS.join(", ")}）`;
 	}
@@ -952,7 +942,7 @@ function registerProviderInSession(pi: ExtensionAPI, id: string, config: Provide
 	pi.registerProvider(id, {
 		name: config.name,
 		baseUrl: config.baseUrl,
-		apiKey: config.apiKey,
+		apiKey: resolveApiKey(config.apiKey),
 		api: config.api,
 		headers: config.headers,
 		authHeader: config.authHeader,
@@ -1088,7 +1078,7 @@ async function editProviderFlow(pi: ExtensionAPI, ctx: ExtensionContext): Promis
 	while (true) {
 		const choice = await showSelectList(ctx, `编辑渠道 ${picked}`, [
 			{ value: "baseUrl", label: `baseUrl: ${working.baseUrl ?? "(未设置)"}`, description: "API 端点地址" },
-			{ value: "apiKey", label: `apiKey: ${maskApiKey(working.apiKey)}`, description: "API 密钥（$ENV / ${ENV} / !cmd / 字面量）" },
+			{ value: "apiKey", label: `apiKey: ${maskApiKey(working.apiKey)}`, description: "外部环境引用（$NAME / ${NAME}，不会保存密钥字面量）" },
 			{ value: "api", label: `api: ${working.api ?? "(未设置)"}`, description: "API 类型" },
 			{ value: "models", label: `models: ${working.models?.length ?? 0} 个模型`, description: "模型列表" },
 			{
@@ -1131,7 +1121,7 @@ async function editProviderFlow(pi: ExtensionAPI, ctx: ExtensionContext): Promis
 				break;
 			}
 			case "apiKey": {
-				const v = await ctx.ui.input("API Key（$ENV / ${ENV} / !cmd / 字面量，留空清除）:", working.apiKey ?? "");
+				const v = await ctx.ui.input("API Key（$NAME / ${NAME}，留空清除）:", working.apiKey ?? "");
 				if (v === undefined) break;
 				working.apiKey = v.trim() || undefined;
 				dirty = true;

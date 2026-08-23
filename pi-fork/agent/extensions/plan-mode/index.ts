@@ -177,6 +177,22 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	pi.on("context", async (event) => {
 		if (planModeEnabled) return;
 
+		// 先扫描是否有要过滤的消息；没有则返回 undefined，不重建数组（避免 history-rewritten cache 失效）。
+		const needsFilter = event.messages.some((m) => {
+			const msg = m as AgentMessage & { customType?: string };
+			if (msg.customType === "plan-mode-context") return true;
+			if (msg.role !== "user") return false;
+			const content = msg.content;
+			if (typeof content === "string") return content.includes("[PLAN MODE ACTIVE]");
+			if (Array.isArray(content)) {
+				return content.some(
+					(c) => c.type === "text" && (c as TextContent).text?.includes("[PLAN MODE ACTIVE]"),
+				);
+			}
+			return false;
+		});
+		if (!needsFilter) return undefined;
+
 		return {
 			messages: event.messages.filter((m) => {
 				const msg = m as AgentMessage & { customType?: string };

@@ -11,11 +11,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { resolveModelAlias } from "../../model-aliases.ts";
 
 const GOAL_ENTRY = "productivity-goal";
 const GOAL_CONTEXT = "productivity-goal-context";
 const GOAL_TRIGGER = "productivity-goal-trigger";
 const MAX_AUTO_CONTINUATIONS = 6;
+const DEFAULT_QUERY_MAX_TOKENS = 4096;
 
 type GoalStatus = "active" | "paused" | "blocked" | "usage_limited" | "budget_limited" | "complete";
 
@@ -147,7 +149,7 @@ function resolveQueryModel(ctx: ExtensionContext, requested?: string): Model<any
 		return ctx.model;
 	}
 
-	const needle = requested.trim();
+	const needle = resolveModelAlias(requested) as string;
 	const available = ctx.scopedModels.length > 0
 		? ctx.scopedModels.map((entry) => entry.model)
 		: ctx.modelRegistry.getAvailable();
@@ -638,19 +640,20 @@ export default function productivityExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "llm_query",
 		label: "LLM Query",
-		description: "Ask an available LLM a bounded, context-isolated question for a second opinion, classification, rewrite, or concise analysis. Uses the current model unless provider/model is supplied. Returned text and retained details are capped at 50KB/2000 lines.",
+		description: "Ask an available LLM one bounded, context-isolated question for a second opinion, classification, rewrite, or concise analysis. Uses the current model unless provider/model is supplied. Returned text and retained details are capped at 50KB/2000 lines.",
 		promptSnippet: "Ask an available LLM a bounded context-isolated question",
 		promptGuidelines: [
+			"Use at most one llm_query for the same request; do not combine it with optimize_prompt unless the two tasks are genuinely different.",
 			"Use llm_query for a bounded second opinion or transformation, not for repository exploration or work that needs coding tools.",
 			"Give llm_query all indispensable context in its prompt because it does not inherit the current conversation or files.",
 		],
-		executionMode: "parallel",
+		executionMode: "sequential",
 		parameters: Type.Object({
 			prompt: Type.String({ minLength: 1, maxLength: 100_000, description: "Self-contained question or task for the nested LLM" }),
 			systemPrompt: Type.Optional(Type.String({ maxLength: 20_000, description: "Optional role/instructions for the nested LLM" })),
 			model: Type.Optional(Type.String({ description: "Optional exact provider/model; defaults to the current model" })),
 			thinking: Type.Optional(StringEnum(["minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Reasoning effort for capable models (default low)" })),
-			maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 32768, description: "Maximum response tokens (default 8192)" })),
+			maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 32768, description: "Maximum response tokens (default 4096)" })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const model = resolveQueryModel(ctx, params.model);
@@ -670,7 +673,7 @@ export default function productivityExtension(pi: ExtensionAPI): void {
 				},
 				{
 					signal,
-					maxTokens: Math.min(params.maxTokens ?? 8192, model.maxTokens),
+					maxTokens: Math.min(params.maxTokens ?? DEFAULT_QUERY_MAX_TOKENS, model.maxTokens),
 					cacheRetention: "none",
 					...queryReasoningOptions(
 						model,
@@ -822,14 +825,17 @@ export default function productivityExtension(pi: ExtensionAPI): void {
 
 	pi.on("context", async (event) => {
 		let lastGoalMessage = -1;
+		let goalMessageCount = 0;
 		for (let i = event.messages.length - 1; i >= 0; i--) {
 			const customType = (event.messages[i] as { customType?: string }).customType;
 			if (customType === GOAL_CONTEXT || customType === GOAL_TRIGGER) {
-				lastGoalMessage = i;
-				break;
+				if (lastGoalMessage === -1) lastGoalMessage = i;
+				goalMessageCount++;
 			}
 		}
 		const keepLatest = goal?.status === "active";
+		// 短路：无 goal 消息，或仅一条且要保留 → 不重建数组，避免触发 history-rewritten cache 失效。
+		if (goalMessageCount === 0 || (keepLatest && goalMessageCount === 1)) return undefined;
 		return {
 			messages: event.messages.filter((message, index) => {
 				const customType = (message as { customType?: string }).customType;

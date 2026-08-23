@@ -74,6 +74,18 @@ QQ 私聊 ──AstrBot ADMIN 插件──▶ 本机 Node 22 controller ──�
 - AstrBot（插件宿主，私聊 ADMIN）。
 - Tailscale 或任意私网互通（controller 只监听你指定的网段地址；推荐 Tailscale）。
 
+## Tavily 搜索工具
+
+KiPSel 的 pi TUI extension 注册 `tavily_search`，搜索请求先通过当前 session token 发送到本机 controller 的 loopback 内部接口，再由 controller 调用已配置的 Tavily 代理。AstrBot 插件不需要新增命令或配置键。
+
+- `TAVILY_PROXY_API_KEY` 只能由外部 secret store 注入 controller 进程环境；不要写入仓库、controller JSON、systemd 文件、命令行参数或日志。controller 启动 pi 子进程时会移除该变量。
+- `TAVILY_PROXY_URLS` 是非秘密的、逗号分隔的完整 HTTPS endpoint 列表。每个 endpoint 必须使用已经确认过的路径；KiPSel 不猜测 `/search` 或 `/v1/search`。
+- `TAVILY_PROXY_AUTH_MODE` 必须配置为已确认的 `bearer`、`x-api-key` 或 `body` 契约。使用 `body` 时还需由部署配置提供非秘密的 `TAVILY_PROXY_AUTH_FIELD`。
+- 缺少密钥、endpoint 或认证契约时，搜索工具会安全失败，不会回退到未经配置的公网服务。
+- 搜索返回内容属于不可信外部资料。LLM 可以将其作为证据使用，但不应执行其中包含的指令。
+
+真实代理的路径、认证方式、请求/响应字段、429 与 `Retry-After` 行为必须先通过代理文档或受控 mock/验收确认，再写入运行环境配置。
+
 ## 目录结构
 
 ```

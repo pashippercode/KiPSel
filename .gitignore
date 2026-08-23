@@ -64,3 +64,6 @@ temp/
 
 # Keep distributable examples/templates
 !*.example
+
+# Nested OSS plugin repos (separate remotes)
+oss/

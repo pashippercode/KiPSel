@@ -6,7 +6,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test core.test.ts"
+    "test": "node --experimental-strip-types --test core.test.ts tavily.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.84.1"

@@ -24,6 +24,6 @@ Output MUST follow this exact format:
 Rules:
 - `improvedTask`: smallest spec that is directly executable by the worker agent.
 - `acceptanceCriteria`: concrete enough to verify (no vague wording).
-- `score`: integer 0-10 confidence. If score < 8 or openQuestions materially changes behavior, self-iterate once more and re-output a single JSON object.
+- `score`: integer 0-10 confidence. Report uncertainty in `openQuestions`; do not self-iterate or make a second model call.
 - No markdown, no prose outside the JSON.
 - Do NOT ask user questions; list ambiguities in `openQuestions` instead.

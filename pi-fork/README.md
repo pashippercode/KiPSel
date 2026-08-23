@@ -67,6 +67,14 @@
 - 本 fork 的 `deliver` 投递管线即采用其同一投递模式；`optimize_prompt` 对应其 prompt 优化思路，但落地为独立可选模型。
 - 未整体采用原因：其子代理为进程内 in-memory 会话（与本机"冷启动独立进程 + 真实 usage 统计"路线不同），且与 workflow-audit 相位门控的交互需另行验证。
 
+## 拆出的独立 Pi 插件
+
+下列三个包在 `oss/`（独立 git 仓，不进入本仓提交）中维护，README 中英双语：
+
+- [`claude-status-imitating`](https://github.com/pashippercode/claude-status-imitating) — Claude Code 风格 working 指示器
+- [`edit-with-audit`](https://github.com/pashippercode/edit-with-audit) — 轻量：相位门禁 + LLM 审查
+- [`now-you-are-the-boss`](https://github.com/pashippercode/now-you-are-the-boss) — 重型：子代理编排 + `/work`
+
 ## 版本
 
 - 定制层版本：0.2.0

@@ -67,10 +67,16 @@ function makeSpawn(spawns) {
   };
 }
 
-async function fixture(overrides = {}) {
+async function fixture(overrides = {}, dependencyOverrides = {}) {
   const root = await mkdtemp(join(tmpdir(), "kipsel-controller-test-"));
   const bearer = randomBytes(24).toString("base64url");
   const spawns = [];
+  const environment = dependencyOverrides.env ?? {
+    TAVILY_PROXY_API_KEY: "test-only-tavily-sentinel",
+    TAVILY_PROXY_URLS: "https://search.example.test/search",
+    TAVILY_PROXY_AUTH_MODE: "bearer",
+  };
+  const { env: _ignoredEnv, ...injectedDependencies } = dependencyOverrides;
   const config = {
     external: {
       host: "127.0.0.1",
@@ -112,8 +118,12 @@ async function fixture(overrides = {}) {
   };
   const controller = await createController(config, {
     spawn: makeSpawn(spawns),
+    sleep: async () => {},
+
     readFile: fakeProcessRead(spawns),
     kill: () => {},
+    env: environment,
+    ...injectedDependencies,
   });
   const addresses = await controller.start();
   const external = `http://127.0.0.1:${addresses.external.port}`;
@@ -193,6 +203,64 @@ test("external API rejects a request without bearer authentication", async (t) =
   assert.equal(json.error, "unauthorized");
 });
 
+test("internal Tavily search is session-authenticated and forwards only safe fields", async (t) => {
+  const calls = [];
+  const context = await fixture({}, {
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({
+        query: "cats",
+        results: [{ title: "Cats", url: "https://example.test/cats", content: "A result" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  t.after(() => context.close());
+  const started = await startSession(context);
+  const sessionId = started.json.session.sessionId;
+  const internalToken = context.spawns[0].options.env.KIPSEL_INTERNAL_TOKEN;
+
+  const rejected = await request(context.internal, "/internal/tavily-search", {
+    bearer: "wrong-token",
+    body: { sessionId, query: "cats" },
+  });
+  assert.equal(rejected.response.status, 401);
+
+  const searched = await request(context.internal, "/internal/tavily-search", {
+    bearer: internalToken,
+    body: { sessionId, query: "cats", max_results: 1, ignored: "discarded" },
+  });
+  assert.equal(searched.response.status, 200);
+  assert.equal(searched.json.query, "cats");
+  assert.equal(searched.json.results[0].title, "Cats");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://search.example.test/search");
+  assert.equal(calls[0].options.headers.authorization, "Bearer test-only-tavily-sentinel");
+  assert.deepEqual(JSON.parse(calls[0].options.body), { query: "cats", max_results: 1 });
+});
+
+test("internal Tavily search fails closed when the controller key is absent", async (t) => {
+  let calls = 0;
+  const context = await fixture({}, {
+    env: {
+      TAVILY_PROXY_URLS: "https://search.example.test/search",
+      TAVILY_PROXY_AUTH_MODE: "bearer",
+    },
+    fetch: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ results: [] }), { status: 200 });
+    },
+  });
+  t.after(() => context.close());
+  const started = await startSession(context);
+  const result = await request(context.internal, "/internal/tavily-search", {
+    bearer: context.spawns[0].options.env.KIPSEL_INTERNAL_TOKEN,
+    body: { sessionId: started.json.session.sessionId, query: "cats" },
+  });
+  assert.equal(result.response.status, 503);
+  assert.equal(result.json.error, "tavily-not-configured");
+  assert.equal(calls, 0);
+});
+
 test("start uses an argv array, keeps internal token out of argv, and enforces session limit", async (t) => {
   const context = await fixture();
   t.after(() => context.close());
@@ -210,6 +278,8 @@ test("start uses an argv array, keeps internal token out of argv, and enforces s
   assert.equal(call.args.includes("--extension"), true);
   assert.equal(call.args.includes("--model"), true);
   assert.equal(call.args.includes(call.options.env.KIPSEL_INTERNAL_TOKEN), false);
+  assert.equal("TAVILY_PROXY_API_KEY" in call.options.env, false);
+
 
   const second = await startSession(context, "beta");
   assert.equal(second.response.status, 429);

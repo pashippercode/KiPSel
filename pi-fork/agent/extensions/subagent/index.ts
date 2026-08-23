@@ -30,6 +30,9 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { mapWithScopedConcurrency } from "./scheduler.ts";
+import { BackgroundJobRegistry, type BackgroundJobMode, type BackgroundJobSummary } from "./jobs.ts";
+import { resolveModelAlias } from "../../model-aliases.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -119,7 +122,7 @@ async function readDefaultModel(): Promise<string | undefined> {
 	try {
 		const raw = await fs.promises.readFile(SUBAGENT_CONFIG_FILE, "utf-8");
 		const cfg = JSON.parse(raw) as { defaultModel?: string | null };
-		return cfg.defaultModel || undefined;
+		return resolveModelAlias(cfg.defaultModel || undefined);
 	} catch {
 		return undefined;
 	}
@@ -341,26 +344,6 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 	return items;
 }
 
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
@@ -418,7 +401,7 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	const effectiveModel = modelOverrides.get(agentName) ?? agent.model ?? (await readDefaultModel());
+	const effectiveModel = resolveModelAlias(modelOverrides.get(agentName) ?? agent.model ?? (await readDefaultModel()));
 	if (effectiveModel) args.push("--model", effectiveModel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
@@ -559,6 +542,14 @@ const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	scope: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Mutation scope roots. Tasks with overlapping roots are serialized; omit only for readOnly tasks.",
+		}),
+	),
+	readOnly: Type.Optional(
+		Type.Boolean({ description: "Declare that the task performs no writes; read-only tasks may share an empty scope." }),
+	),
 });
 
 const ChainItem = Type.Object({
@@ -582,10 +573,13 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	background: Type.Optional(
+		Type.Boolean({ description: "Run detached and return a job id; completion is delivered as a follow-up. Default: false.", default: false }),
+	),
 	optimizePrompt: Type.Optional(
 		Type.Boolean({
 			description:
-				"Run each task through the prompt optimizer before delegation (uses promptOptimizerModel from subagent-config.json, or optimizerModel). Default: false.",
+				"Optionally run each task through the prompt optimizer once before delegation; use only for verbose/fuzzy tasks and do not combine with llm_query for the same request. Default: false.",
 			default: false,
 		}),
 	),
@@ -597,6 +591,7 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	const backgroundJobs = new BackgroundJobRegistry();
 	// ── 子代理主动投递（配合 subagent-deliver 扩展） ────────────────────────
 	// 子代理进程通过 PI_SUBAGENT_SPOOL 环境变量把投递消息写到 spool 目录，
 	// withDeliverySpool 的轮询器读走后调用 deliver()，经 pi.sendMessage 投递进主会话。
@@ -628,12 +623,29 @@ export default function (pi: ExtensionAPI) {
 		for (const payload of queued) deliver(payload);
 	};
 
+	const notifyBackgroundJob = (jobId: string, status: string, output: string): void => {
+		if (!deliveryEnabled) return;
+		try {
+			pi.sendMessage(
+				{
+					customType: "subagent-job",
+					content: `[subagent job ${jobId}] ${status}\n\n${output || "(no output)"}\n\nUse subagent_jobs for the stored summary or subagent_cancel for a running job.`,
+					display: true,
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+		} catch (error) {
+			console.warn(`[subagent-job] completion delivery failed: ${error}`);
+		}
+	};
+
 	pi.on("session_start", () => {
 		deliveryEnabled = true;
 		flushPendingDeliveries();
 	});
 	pi.on("session_shutdown", () => {
 		deliveryEnabled = false;
+		backgroundJobs.cancelAll();
 	});
 
 	// ── 提示词优化器（独立可选模型） ───────────────────────────────────────
@@ -650,7 +662,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const raw = await fs.promises.readFile(SUBAGENT_CONFIG_FILE, "utf-8");
 			const cfg = JSON.parse(raw) as { promptOptimizerModel?: string | null };
-			return cfg.promptOptimizerModel || undefined;
+			return resolveModelAlias(cfg.promptOptimizerModel || undefined);
 		} catch {
 			return undefined;
 		}
@@ -660,7 +672,7 @@ export default function (pi: ExtensionAPI) {
 		requested: string | undefined,
 		ctx: ExtensionContext,
 	): Promise<Model<any>> => {
-		const needle = requested?.trim() || (await loadPromptOptimizerModel())?.trim();
+		const needle = resolveModelAlias(requested) ?? (await loadPromptOptimizerModel());
 		const available =
 			ctx.scopedModels.length > 0 ? ctx.scopedModels.map((entry) => entry.model) : ctx.modelRegistry.getAvailable();
 		if (needle) {
@@ -842,7 +854,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			action: StringEnum(["set", "clear", "list"] as const),
 			agent: Type.Optional(Type.String({ description: "Agent name (required for set/clear)" })),
-			model: Type.Optional(Type.String({ description: "Model like lavenda/xxx (required for set)" })),
+			model: Type.Optional(Type.String({ description: "Model like provider/xxx or a configured alias such as luna (required for set)" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const action = params.action;
@@ -858,8 +870,9 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: had ? `Override cleared: ${agentName}` : `No override was set for ${agentName}.` }], details: {} };
 			}
 			// set
-			const model = (params.model ?? "").trim();
-			if (!model) return { content: [{ type: "text", text: "model is required for set." }], details: {} };
+			const requestedModel = (params.model ?? "").trim();
+			if (!requestedModel) return { content: [{ type: "text", text: "model is required for set." }], details: {} };
+			const model = resolveModelAlias(requestedModel) as string;
 			const available = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
 			if (!available.includes(model)) {
 				return { content: [{ type: "text", text: `Unknown model "${model}". Available: ${available.join(", ")}` }], details: {} };
@@ -869,19 +882,62 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	const formatBackgroundJob = (job: BackgroundJobSummary): string => {
+		const finished = job.finishedAt ? ` finished=${new Date(job.finishedAt).toISOString()}` : "";
+		const output = job.output ? `\n${job.output}` : "";
+		const error = job.error ? `\nerror: ${job.error}` : "";
+		return `${job.id} [${job.mode}] ${job.status} started=${new Date(job.startedAt).toISOString()}${finished}${error}${output}`;
+	};
+
+	pi.registerTool({
+		name: "subagent_jobs",
+		label: "Subagent Jobs",
+		description: "List detached subagent jobs or inspect one job by id. Background completion is also delivered as a follow-up message.",
+		parameters: Type.Object({
+			id: Type.Optional(Type.String({ description: "Optional background job id" })),
+		}),
+		async execute(_toolCallId, params) {
+			const requested = params.id ? backgroundJobs.get(params.id) : undefined;
+			const jobs = params.id ? (requested ? [requested] : []) : backgroundJobs.list();
+			const text = jobs.length > 0 ? jobs.map(formatBackgroundJob).join("\n\n") : params.id ? `Unknown job: ${params.id}` : "No background subagent jobs.";
+			return { content: [{ type: "text", text }], details: { jobs } };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Cancel Subagent Job",
+		description: "Cancel a running detached subagent job by id. The child process receives an abort signal and its scope is released after cleanup.",
+		parameters: Type.Object({ id: Type.String({ description: "Background job id" }) }),
+		async execute(_toolCallId, params) {
+			const cancelled = backgroundJobs.cancel(params.id);
+			return {
+				content: [{ type: "text", text: cancelled ? `Cancel requested: ${params.id}` : `Job is not running or does not exist: ${params.id}` }],
+				details: { id: params.id, cancelled },
+			};
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Parallel tasks with overlapping mutation scopes are serialized; use readOnly: true only for tasks that perform no writes.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const runBody = async (spoolDir: string) => {
+		async execute(_toolCallId, params, toolSignal, toolOnUpdate, ctx) {
+			const runBody = async (
+				spoolDir: string,
+				runSignal: AbortSignal | undefined = toolSignal,
+				runOnUpdate: OnUpdateCallback | undefined = toolOnUpdate,
+			) => {
+			const signal = runSignal;
+			const onUpdate = runOnUpdate;
 			const maybeOptimize = async (task: string): Promise<string> => {
 				if (!params.optimizePrompt) return task;
 				try {
@@ -896,6 +952,10 @@ export default function (pi: ExtensionAPI) {
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			const taskScopes = (task: { scope?: string[]; readOnly?: boolean; cwd?: string }): readonly string[] => {
+				if (task.readOnly) return [];
+				return task.scope && task.scope.length > 0 ? task.scope : [task.cwd ?? ctx.cwd];
+			};
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -921,6 +981,14 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			if (params.background && (agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+				return {
+					content: [{ type: "text", text: "Background jobs cannot open a project-agent confirmation dialog. Set confirmProjectAgents=false only for a trusted project." }],
+					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
 				};
 			}
 
@@ -1045,7 +1113,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+				const results = await mapWithScopedConcurrency(params.tasks, MAX_CONCURRENCY, taskScopes, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
@@ -1122,6 +1190,33 @@ export default function (pi: ExtensionAPI) {
 				details: makeDetails("single")([]),
 			};
 		};
+
+			if (params.background) {
+				const mode: BackgroundJobMode = params.chain?.length ? "chain" : params.tasks?.length ? "parallel" : "single";
+				const job = backgroundJobs.start(mode);
+				void withDeliverySpool((payload) => deliver(payload), (spoolDir) => runBody(spoolDir, job.controller.signal, undefined))
+					.then((result) => {
+						const output = result.content
+							.filter((part): part is { type: "text"; text: string } => part.type === "text")
+							.map((part) => part.text)
+							.join("\n");
+						const failed = (result as { isError?: boolean }).isError === true;
+						if (failed) backgroundJobs.fail(job.id, output || "background subagent failed");
+						else backgroundJobs.complete(job.id, output);
+						const summary = backgroundJobs.get(job.id);
+						if (summary) notifyBackgroundJob(job.id, summary.status, summary.output ?? summary.error ?? output);
+					})
+					.catch((error) => {
+						const message = error instanceof Error ? error.message : String(error);
+						backgroundJobs.fail(job.id, message, job.controller.signal.aborted);
+						const summary = backgroundJobs.get(job.id);
+						if (summary) notifyBackgroundJob(job.id, summary.status, summary.error ?? message);
+					});
+				return {
+					content: [{ type: "text", text: `Background subagent started: ${job.id} (${mode}). Use subagent_jobs to inspect completion.` }],
+					details: { jobId: job.id, mode, status: "running" },
+				};
+			}
 
 			return withDeliverySpool((payload) => deliver(payload), runBody);
 		},

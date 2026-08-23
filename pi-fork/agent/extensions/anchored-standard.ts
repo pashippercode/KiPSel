@@ -175,19 +175,29 @@ function toolNamesInPayload(payload: unknown): string[] {
  * Two groups:
  * - 投递/优化: deliver (subagent-deliver) 与 optimize_prompt (subagent) 是扩展注册
  *   的新工具，bootstrap 期间隐藏会破坏投递通道与提示词优化。
- * - 编排器工作流工具: work.md 引用的编排器工具（subagent、相位切换、目标锚点、
- *   llm_query）。anchored-standard 的 session_start 会重写全量目录，若不在此登记，
+ * - 编排器工作流工具: work.md 引用的编排器工具（subagent、subagent_jobs、subagent_cancel、相位切换、目标锚点、todo_write、llm_query）。anchored-standard 的 session_start 会重写全量目录，若不在此登记，
  *   主会话前 N 轮将拿不到这些工具，WORKFLOW MODE 的 Step 0 goal 锚定会直接失败。
  */
 const BOOTSTRAP_PASSTHROUGH_TOOLS = [
   "deliver",
   "optimize_prompt",
   "subagent",
+  "subagent_jobs",
+  "subagent_cancel",
   "subagent_set_model",
   "audit_set_phase",
   "get_goal",
   "update_goal",
+  "todo_write",
   "llm_query",
+  "workflow",
+  // pi-web-access（npm:pi-web-access）：web 搜索/正文抓取工具，bootstrap 期间隐藏会导致
+  // KiPSel 前 N 轮无法读取 URL 正文（tavily_search 只返回摘要）。
+  // 实际安装因 npm 网络问题改用 @juicesharp/rpiv-web-tools（web_search/web_fetch）。
+  "web_search",
+  "web_fetch",
+  "fetch_content",
+  "source_check",
 ];
 
 function filterPayloadTools(payload: unknown, shellTools: string[], commonTools: string[]): unknown {
@@ -349,7 +359,7 @@ export default function anchoredStandard(pi: ExtensionAPI, config: AnchoredConfi
   const persona = config.persona ?? DEFAULT_PERSONA;
   const shellTools = config.shellTools ?? [process.platform === "win32" ? "pwsh" : "bash"];
   const commonTools = config.commonTools ?? ["read"];
-  const fullTools = config.fullTools ?? [process.platform === "win32" ? "pwsh" : "bash", "read", "edit", "write", "todo_write"];
+  const fullTools = config.fullTools ?? [process.platform === "win32" ? "pwsh" : "bash", "read", "edit", "write", "todo_write", "workflow"];
   let bootstrapped = false;
   let turnCount = 0;
   // Env/config are available at load time; the CLI flag is applied after

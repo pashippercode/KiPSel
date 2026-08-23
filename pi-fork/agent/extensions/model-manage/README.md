@@ -22,7 +22,7 @@
 ### 树形模型编辑器（新增/编辑渠道共用）
 
 - **模型列表**：每个模型一项（label=id，description=属性摘要），另有「＋ 新增模型」「⇣ 从上游获取模型」「← 完成」
-- **上游获取**：从当前渠道 `GET {baseUrl}/models` 拉取模型列表（15s 超时），逐个选择或「全部填入」导入；重复项自动跳过；支持 `$ENV`/`${ENV}`/`!cmd`/字面量 apiKey 运行时解析，响应中的密钥字样会被脱敏
+- **上游获取**：从当前渠道 `GET {baseUrl}/models` 拉取模型列表（15s 超时），逐个选择或「全部填入」导入；重复项自动跳过；apiKey 仅支持 `$ENV`/`${ENV}` 外部环境引用，响应中的密钥字样会被脱敏
 - **导入补全**：导入时自动带入参数——按模型 id 补全 `reasoning: true` + 八档 `thinkingLevelMap`（思考深度）/ `input`（含 image/vision 等关键字的模型自动加图像）/ `contextWindow` / `maxTokens` / 零成本 `cost`；上游返回的 `reasoning`/`input_modalities`/`context_window` 等能力字段会映射覆盖默认值，导入后可在属性层逐项修改
 - **模型属性**：每个属性一项（label=属性名，description=当前值），另有重命名 id / 新增属性 / 删除属性 / 删除此模型 / 返回
 - **属性值**：按类型编辑——id/name 文本、api 下拉、reasoning 布尔、input 字符串数组、contextWindow/maxTokens 正整数、cost/thinkingLevelMap/compat 及未知属性 JSON 值
@@ -56,5 +56,6 @@ cp "$(ls -t ~/.pi/agent/models.json.bak-model-manage-* | head -1)" ~/.pi/agent/m
 
 ## 安全
 
-- apiKey 在列表、通知、确认框与详情视图中一律掩码显示（`$***` / `***len`），任何 apiKey 字面量不会进入 LLM 上下文
+- apiKey 只能保存为 `$NAME` 或 `${NAME}` 环境变量引用；扩展不会执行配置中的 shell 命令，也不会把密钥字面量写入 models.json
+- 已存在的旧字面量配置仍只读掩码显示；编辑保存前必须改成环境变量引用。
 - 除确认后的写入外，扩展在导入与运行中不会触碰 models.json

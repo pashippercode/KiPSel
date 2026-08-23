@@ -16,8 +16,7 @@ import {
   verifyBearer,
   verifyProcessOwnership,
 } from "./registry.mjs";
-
-const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+import { TavilyClient, TavilyClientError } from "./tavily.mjs";
 const DEFAULT_CONFIG_PATH = resolve(homedir(), ".config/kipsel/controller.json");
 const LOOPBACK_HOST = "127.0.0.1";
 const LIVE_STATUSES = new Set(["starting", "running", "stopping", "stale"]);
@@ -321,6 +320,9 @@ function mappedError(error) {
     };
     return new ControllerError(statuses[error.code] ?? 500, error.code, error.message);
   }
+  if (error instanceof TavilyClientError) {
+    return new ControllerError(error.status, error.code, error.message);
+  }
   return new ControllerError(500, "internal-error", "Internal controller error");
 }
 
@@ -399,6 +401,13 @@ export async function createController(config, dependencies = {}) {
   const read = dependencies.readFile ?? readFile;
   const kill = dependencies.kill ?? process.kill.bind(process);
   const now = dependencies.now ?? Date.now;
+  const environment = dependencies.env ?? process.env;
+  const tavily = dependencies.tavily ?? new TavilyClient({
+    env: environment,
+    fetchImpl: dependencies.fetch ?? globalThis.fetch,
+    now,
+    sleep: dependencies.sleep,
+  });
   const registry = dependencies.registry ?? new SessionRegistry({ statePath: config.statePath });
   await registry.load();
   const jobs = dependencies.jobs ?? new JobStore({
@@ -522,19 +531,21 @@ export async function createController(config, dependencies = {}) {
     ];
     if (profile.model) args.push("--model", profile.model);
 
+    const childEnvironment = {
+      ...environment,
+      DISPLAY: config.terminal.display,
+      XAUTHORITY: config.terminal.xauthority,
+      KIPSEL_ALIAS: alias,
+      KIPSEL_INTERNAL_TOKEN: internalToken,
+      KIPSEL_INTERNAL_URL: `http://${config.internal.host}:${config.internal.port}`,
+      KIPSEL_OWNER: ownerMarker,
+      KIPSEL_SESSION_ID: sessionId,
+    };
+    delete childEnvironment.TAVILY_PROXY_API_KEY;
     const child = spawn(config.terminal.executable, args, {
       cwd: project.cwd,
       detached: true,
-      env: {
-        ...process.env,
-        DISPLAY: config.terminal.display,
-        XAUTHORITY: config.terminal.xauthority,
-        KIPSEL_ALIAS: alias,
-        KIPSEL_INTERNAL_TOKEN: internalToken,
-        KIPSEL_INTERNAL_URL: `http://${config.internal.host}:${config.internal.port}`,
-        KIPSEL_OWNER: ownerMarker,
-        KIPSEL_SESSION_ID: sessionId,
-      },
+      env: childEnvironment,
       stdio: "ignore",
     });
     if (!Number.isSafeInteger(child.pid)) {
@@ -808,6 +819,9 @@ export async function createController(config, dependencies = {}) {
     const record = authenticateInternal(request, body);
     const route = `${request.method} ${new URL(request.url ?? "/", "http://internal.invalid").pathname}`;
 
+    if (route === "POST /internal/tavily-search") {
+      return sendJson(response, 200, await tavily.search(body));
+    }
     if (route === "POST /internal/poll") {
       return sendJson(
         response,
