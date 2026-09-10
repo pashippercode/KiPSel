@@ -1,4 +1,6 @@
 {
-  "defaultModel": "111/gpt-5.6-luna",
-  "promptOptimizerModel": "111/gpt-5.6-luna"
+  "defaultModel": "111/gemini-3.7-flash-high",
+  "promptOptimizerModel": null,
+  "compactionModel": "111/deepseek-v4-flash",
+  "reviewModel": "111/grok-4.6"
 }

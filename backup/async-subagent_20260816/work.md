@@ -19,7 +19,7 @@ This workflow is AUTHORITATIVE. It takes precedence over normal chit-chat, free-
 - Never print secrets, tokens, or private credentials.
 - Keep these workflow artifacts separate:
   - **Goal**: one stable, self-contained outcome; update it only when the user changes the objective.
-  - **Todo**: the live execution checklist; maintain status with `workflow(action=todo_write)` (legacy alias `todo_write`), not by rewriting the approved plan.
+  - **Todo**: the live execution checklist; maintain status with `todo_write`, not by rewriting the approved plan.
   - **Approved Plan**: the immutable scope contract for files, commands, risks, and rollback; submit a new revision only when scope changes.
 - Workflow ends only when verification passes and capture is approved (or user aborts).
 
@@ -33,7 +33,7 @@ You SHOULD keep these phrases in your reasoning so audit/status tools can trace:
 - **Phase verify** (run minimum checks; label outcomes honestly)
 - **Phase capture** (write only `~/.pi/agent/knowledge/<scope>.md`)
 
-**Phase switching**: you (the orchestrator) MUST call `workflow(action=phase_set)` (legacy alias `audit_set_phase`, when available) when entering each phase (plan → active → review → verify → capture). The statusline shows the current phase. If a subagent's configured model fails (429/unknown), use `subagent_set_model` to temporarily reroute it to an available model (process-scoped; survives `/reload`, cleared on process restart).
+**Phase switching**: you (the orchestrator) MUST call the `audit_set_phase` tool (when available) when entering each phase (plan → active → review → verify → capture). The statusline shows the current phase. If a subagent's configured model fails (429/unknown), use `subagent_set_model` to temporarily reroute it to an available model (session-scoped).
 
 ########################################
 ## Step 0 — Normalize (read-only)
@@ -43,7 +43,7 @@ Only when ambiguity materially blocks scope or acceptance criteria, choose exact
 
 Store final canonical spec as `SPEC` (short). Do not preserve long prose.
 
-Then anchor the session goal to the SPEC (Codex-style truncation anchor): call `workflow(action=goal_set)` (legacy alias `update_goal`) with `objective` = the SPEC goal sentence only. Keep approval scope/files in the Plan, not in the Goal. If a matching goal already exists, skip resetting it. Keep the Goal ≤ 2 lines and self-contained: it is the ONLY context guaranteed to survive compaction.
+Then anchor the session goal to the SPEC (Codex-style truncation anchor): call `update_goal` with `objective` = the SPEC goal sentence only. Keep approval scope/files in the Plan, not in the Goal. If a matching goal already exists, skip resetting it. Keep the Goal ≤ 2 lines and self-contained: it is the ONLY context guaranteed to survive compaction.
 
 ########################################
 ## Step 1 — Read-only scout
@@ -60,7 +60,7 @@ For multi-file, security-sensitive, concurrency-sensitive, or uncertain tasks, u
 5) Risks
 6) Scope/risk summary for `workflow_submit_plan`; do not treat planner prose or natural-language “yes” as approval.
 
-The Plan is an approval contract, not a progress checklist. After structured approval, initialize the live checklist with `workflow(action=todo_write)`; update todo status as work proceeds without rewriting the Plan unless files, commands, or scope change.
+The Plan is an approval contract, not a progress checklist. After structured approval, initialize the live checklist with `todo_write`; update todo status as work proceeds without rewriting the Plan unless files, commands, or scope change.
 
 STOP if user rejects.
 
@@ -68,10 +68,9 @@ STOP if user rejects.
 ## Step 3 — Implement (write-capable ONLY after approval)
 Only after `workflow_approve_plan` approves the current `planHash` and `revision`, and you have entered **Phase active**, implement the approved steps. For small local edits the orchestrator may write directly; use one `worker` only when delegation materially helps or the plan has independent bounded work. Natural-language “yes” alone is not structured authorization.
 - Keep changes strictly inside approved files.
-- Before implementation, create/update a `workflow(action=todo_write)` checklist whose items mirror the approved Plan steps.
+- Before implementation, create/update a `todo_write` checklist whose items mirror the approved Plan steps.
 - Mark checklist items as completed or blocked as work proceeds; do not create Plan revisions merely to record progress or command output.
 - For parallel subagent tasks, provide disjoint `scope` roots; set `readOnly: true` only when the task performs no writes. Overlapping mutation scopes are serialized.
-- For long independent work, `background: true` returns immediately with a job id; continue the main task, then inspect `subagent_jobs` or consume the completion follow-up. Use `subagent_cancel` when the result is no longer needed. Background work is still bounded by declared scope and is cancelled when the parent session shuts down.
 - Each `worker` run should show exit + diff summary (via output).
 
 ########################################
@@ -110,8 +109,3 @@ It appends a compact entry to `~/.pi/agent/knowledge/<scope>.md`.
 ########################################
 ## Usage of side-channel /btw
 You may insert ONLY ONE `btw:` clarification when current step lacks a critical value and the context size is large. Max 2 sentences. Example: `btw：确认本次变更不需要同步 Zed extension rev`. Do NOT ask multi-part choices, do NOT pause for >1 minute, and do NOT use it to re-enter user numbering.
-
-########################################
-## Async subagent dispatch (detached background jobs)
-For long, independent work (scout/planner/reviewer on large or unfamiliar scope), launch with `background: true`: the call returns immediately with a job id; continue the orchestrator's current step, then consume the completion follow-up or poll `subagent_jobs`. Use `subagent_cancel` when the result is no longer needed. Do NOT use background for sequential chains (scout-and-plan / implement / implement-and-review) — those pass output via {previous} and must stay synchronous. Background jobs are bounded by declared scope and cancelled on parent session shutdown.
-

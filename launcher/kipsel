@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# kipsel — grok-pi(Pi agent core in Grok Pager)的本地命令名,
+# 同时负责 PiPilot bridge 的单例生命周期。
+#
+# 前端形态:
+#   TUI —— 本脚本前台运行 grok-pi,这就是你要的终端体验。
+#   web —— 同一时刻由 kipsel-bridge 维持一个 PiPilot bridge;
+#          grok-pi 内部的 pi 进程以 --mode rpc 运行,relay 会把自己
+#          注册成 desktop source,手机/浏览器因此能镜像同一个会话。
+#
+# bridge 是**单例**且**可选**:
+#   - 已有 bridge 就复用,绝不重复起;
+#   - 手动 / systemd 启的 bridge 不归本脚本管,退出时不会去杀它;
+#   - bridge 缺失、依赖没装、启动失败都不影响 grok-pi 本身启动。
+#
+# 二进制仍留在 ~/.local/bin/grok-pi,这样 `grok-pi update` 照常可用。
+set -euo pipefail
+
+# Pi core 需要 node:fs globSync,Node 22 必须排在 PATH 前面。
+if [[ -d "$HOME/.local/node22/node-v22.20.0-linux-x64/bin" ]]; then
+	export PATH="$HOME/.local/node22/node-v22.20.0-linux-x64/bin:$PATH"
+fi
+
+export GROK_HOME="${GROK_HOME:-$HOME/.grok-pi}"
+# Grok 原生 Tasks 面板(Ctrl+G)需要 grok-pi 的 spawn_subagent。
+# 本机 ~/.pi/agent/extensions/subagent 仍作为原版 pi 的兜底。
+export PI_GROK_SUBAGENTS="${PI_GROK_SUBAGENTS:-1}"
+# anchored-standard 已经接管 bash;grok-pi 注入的 bash 扩展会与之冲突,
+# 导致 pager 一直等一个死掉的 Pi RPC 子进程。
+export PI_GROK_BASH="${PI_GROK_BASH:-0}"
+
+GROK_PI_BIN="${GROK_PI_BIN:-$HOME/.local/bin/grok-pi}"
+PI_BIN="${PI_BIN:-$HOME/.local/npm-prefix/bin/pi}"
+BRIDGE_CTL="${KIPSEL_BRIDGE_CTL:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/kipsel-bridge}"
+
+if [[ ! -x "$GROK_PI_BIN" ]]; then
+	echo "kipsel: grok-pi binary not found at $GROK_PI_BIN" >&2
+	exit 127
+fi
+
+has_pi_bin=0
+for arg in "$@"; do
+	case "$arg" in
+		--pi-bin|--pi-bin=*) has_pi_bin=1 ;;
+	esac
+done
+
+# ── bridge 生命周期 ─────────────────────────────────────────────────────
+# 只在真正要开交互式 pager 时管 bridge;一次性/脚本化调用
+# (update、--version、-p 等)不引入后台进程。
+bridge_managed=0
+manage_bridge=1
+for arg in "$@"; do
+	case "$arg" in
+		update | --version | -v | --help | -h | -p | --print) manage_bridge=0 ;;
+	esac
+done
+[[ "${KIPSEL_NO_BRIDGE:-0}" == "1" ]] && manage_bridge=0
+
+if [[ "$manage_bridge" -eq 1 && -x "$BRIDGE_CTL" ]]; then
+	# KIPSEL_HOLDER_PID 必须是**本 wrapper** 的 pid。kipsel-bridge 是本脚本的
+	# 子进程,它的 $$ 在 ensure 返回后就没了;拿它当持有者会被立刻判死回收,
+	# 结果是 TUI 还开着、bridge 却被关掉。
+	if KIPSEL_HOLDER_PID=$$ "$BRIDGE_CTL" ensure; then
+		bridge_managed=1
+	fi
+fi
+
+release_bridge() {
+	[[ "$bridge_managed" -eq 1 ]] || return 0
+	bridge_managed=0
+	KIPSEL_HOLDER_PID=$$ "$BRIDGE_CTL" release || true
+}
+trap release_bridge EXIT INT TERM HUP
+
+# 不用 exec:必须留在前台,才能在退出时回收 bridge 引用。
+if [[ "$has_pi_bin" -eq 1 ]]; then
+	set +e
+	"$GROK_PI_BIN" "$@"
+	rc=$?
+	set -e
+else
+	set +e
+	"$GROK_PI_BIN" --pi-bin "$PI_BIN" "$@"
+	rc=$?
+	set -e
+fi
+
+release_bridge
+trap - EXIT INT TERM HUP
+exit "$rc"

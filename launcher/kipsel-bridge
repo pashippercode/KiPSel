@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# kipsel-bridge — PiPilot bridge 的单例生命周期管理器。
+#
+# 设计目标:
+#   1. bridge 全局只跑一个。多个 kipsel 会话共用,绝不重复起。
+#   2. 只收自己启的:手动 / systemd 启的 bridge 不归本脚本管,永不误杀。
+#   3. 引用计数:最后一个持有者退出时才关。
+#   4. bridge 坏掉/缺失绝不影响 kipsel 本体启动 —— TUI 是主,桥是辅。
+#
+# 子命令:
+#   ensure   确保有一个 bridge 在跑(没有就起,已有就复用),并登记一个持有者
+#   release  注销一个持有者;计数归零且 bridge 是我们启的,才关掉
+#   status   打印当前状态(持有者、归属、健康)
+#   stop     强制停止(仅当我们拥有它);用于人工清理
+#
+# 环境覆盖(便于泛用):
+#   KIPSEL_BRIDGE_DIR  bridge 目录(默认 ~/Projects/pi_pilot/bridge)
+#   KIPSEL_STATE_DIR   状态目录(默认 $XDG_STATE_HOME/kipsel 或 ~/.local/state/kipsel)
+#   PIPILOT_PORT       健康检查端口(默认 9377)
+#   KIPSEL_BRIDGE_LOG  日志路径(默认 $KIPSEL_STATE_DIR/bridge.log)
+set -euo pipefail
+
+BRIDGE_DIR="${KIPSEL_BRIDGE_DIR:-$HOME/Projects/pi_pilot/bridge}"
+STATE_DIR="${KIPSEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/kipsel}"
+PORT="${PIPILOT_PORT:-9377}"
+LOG_FILE="${KIPSEL_BRIDGE_LOG:-$STATE_DIR/bridge.log}"
+
+HOLDERS_DIR="$STATE_DIR/holders"
+MUTEX="$STATE_DIR/mutex"
+SPAWN_RECORD="$STATE_DIR/bridge.owner"
+
+die() { printf 'kipsel-bridge: %s\n' "$*" >&2; exit 1; }
+info() { printf 'kipsel-bridge: %s\n' "$*" >&2; }
+
+# ── 工具 ────────────────────────────────────────────────────────────────
+
+# 当前进程的启动时刻(防 PID 复用);取不到就回退成 0。
+proc_start_time() {
+	local pid="$1"
+	local stat
+	stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || { echo 0; return; }
+	# comm 字段可能含空格/括号,从最后一个 ')' 之后再切。
+	echo "${stat##*)}" | awk '{print $20}'
+}
+
+# 该 pid 是否仍是"同一个"进程(存在且启动时刻一致)。
+same_process() {
+	local pid="$1" recorded="$2"
+	[[ -n "$pid" ]] || return 1
+	[[ -d "/proc/$pid" ]] || return 1
+	[[ "$(proc_start_time "$pid")" == "$recorded" ]] || return 1
+	return 0
+}
+
+bridge_healthy() {
+	local body
+	body="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null)" || return 1
+	[[ "$body" == *'"ok":true'* ]]
+}
+
+# 清理已死持有者的登记。返回存活持有者数量。
+prune_holders() {
+	mkdir -p "$HOLDERS_DIR"
+	local f pid start alive=0
+	for f in "$HOLDERS_DIR"/*; do
+		[[ -e "$f" ]] || continue
+		pid="$(sed -n 's/^pid=//p' "$f" 2>/dev/null | head -1)"
+		start="$(sed -n 's/^start=//p' "$f" 2>/dev/null | head -1)"
+		if same_process "${pid:-}" "${start:-}"; then
+			alive=$((alive + 1))
+		else
+			rm -f "$f"
+		fi
+	done
+	echo "$alive"
+}
+
+holder_count() { prune_holders; }
+
+# 读取归属记录里的字段。
+# 注意:文件不存在时 sed 返回非 0,在 `set -e` + `pipefail` 下会让整个脚本
+# 静默退出(曾经导致 status / stop 无任何输出)。这里统一吞掉失败并返回空串。
+owner_field() {
+	[[ -f "$SPAWN_RECORD" ]] || { echo ""; return 0; }
+	local v=""
+	v="$(sed -n "s/^$1=//p" "$SPAWN_RECORD" 2>/dev/null | head -1)" || v=""
+	echo "$v"
+	return 0
+}
+
+# ── ensure ──────────────────────────────────────────────────────────────
+
+do_ensure() {
+	mkdir -p "$STATE_DIR" "$HOLDERS_DIR"
+
+	exec 9>"$MUTEX"
+	flock 9
+
+	local pid="${KIPSEL_HOLDER_PID:-$$}" start holder_file
+	start="$(proc_start_time "$pid")"
+	holder_file="$HOLDERS_DIR/$pid"
+
+	if bridge_healthy; then
+		# 已有 bridge —— 复用,不重复起。它可能是我们的,也可能是外部的;
+		# 归属由 SPAWN_RECORD 决定,和持有者登记分开记录。
+		:
+	elif [[ -d "$BRIDGE_DIR" ]]; then
+		if [[ ! -x "$BRIDGE_DIR/node_modules/.bin/tsx" ]]; then
+			info "跳过 bridge:$BRIDGE_DIR 未安装依赖(在该目录 npm install)"
+		else
+			mkdir -p "$(dirname "$LOG_FILE")"
+			# setsid:让 npm 成为新进程组组长,退出时能整组清理
+			# (npm → sh → tsx → node 四层,只杀 launcher 会留下孤儿占着端口)。
+			(
+				cd "$BRIDGE_DIR"
+				setsid nohup npm start >>"$LOG_FILE" 2>&1 &
+				echo $! >"$STATE_DIR/.spawned_pid"
+			)
+			local spawned
+			spawned="$(cat "$STATE_DIR/.spawned_pid" 2>/dev/null || echo)"
+			rm -f "$STATE_DIR/.spawned_pid"
+
+			# 等健康检查通过(最多 ~20s)
+			local i
+			for i in $(seq 1 40); do
+				if bridge_healthy; then break; fi
+				sleep 0.5
+			done
+
+			if bridge_healthy && [[ -n "$spawned" ]]; then
+				# 记录归属:pgid 即 setsid 出来的组长 pid
+				{
+					echo "pgid=$spawned"
+					echo "start=$(proc_start_time "$spawned")"
+				} >"$SPAWN_RECORD"
+			elif ! bridge_healthy; then
+				info "bridge 未能在超时内就绪,详见 $LOG_FILE"
+			fi
+		fi
+	else
+		info "跳过 bridge:找不到 $BRIDGE_DIR"
+	fi
+
+	# 登记持有者(无论 bridge 是否可用,登记都可安全注销)
+	{
+		echo "pid=$pid"
+		echo "start=$start"
+	} >"$holder_file"
+
+	flock -u 9
+	exec 9>&-
+	return 0
+}
+
+# ── release ─────────────────────────────────────────────────────────────
+
+do_release() {
+	[[ -d "$STATE_DIR" ]] || return 0
+
+	exec 9>"$MUTEX"
+	flock 9
+
+	rm -f "$HOLDERS_DIR/${KIPSEL_HOLDER_PID:-$$}"
+	local alive
+	alive="$(prune_holders)"
+
+	if [[ "$alive" -eq 0 ]]; then
+		local pgid start
+		pgid="$(owner_field pgid)"
+		start="$(owner_field start)"
+		if [[ -n "$pgid" ]] && same_process "$pgid" "$start"; then
+			# 整组终止:npm / sh / tsx / node 一起收,不留孤儿。
+			kill -TERM -- "-$pgid" 2>/dev/null || true
+			local i
+			for i in $(seq 1 20); do
+				same_process "$pgid" "$start" || break
+				sleep 0.25
+			done
+			same_process "$pgid" "$start" && kill -KILL -- "-$pgid" 2>/dev/null || true
+		fi
+		# 归属记录只在亲手关掉后清除;外部启的 bridge 从没有过记录。
+		rm -f "$SPAWN_RECORD"
+	fi
+
+	flock -u 9
+	exec 9>&-
+	return 0
+}
+
+# ── status / stop ───────────────────────────────────────────────────────
+
+do_status() {
+	local alive pgid
+	alive="$(holder_count 2>/dev/null || echo 0)"
+	pgid="$(owner_field pgid)"
+	printf 'bridge dir : %s\n' "$BRIDGE_DIR"
+	printf 'state dir  : %s\n' "$STATE_DIR"
+	printf 'port       : %s\n' "$PORT"
+	if bridge_healthy; then
+		printf 'health     : ok\n'
+	else
+		printf 'health     : down\n'
+	fi
+	printf 'holders    : %s\n' "$alive"
+	if [[ -n "$pgid" ]]; then
+		printf 'ownership  : started by kipsel (pgid %s)\n' "$pgid"
+	else
+		printf 'ownership  : external (kipsel will not stop it)\n'
+	fi
+}
+
+do_stop() {
+	# 不要写 `exec 9>"$MUTEX" 2>/dev/null`:exec 的重定向会**永久**作用于
+	# 当前 shell,连 stderr 一起吞掉,后面所有 info 都不再可见。
+	mkdir -p "$STATE_DIR" || { info "无法创建状态目录 $STATE_DIR"; return 0; }
+	exec 9>"$MUTEX"
+	flock 9
+
+	local pgid start
+	pgid="$(owner_field pgid)"
+	start="$(owner_field start)"
+	if [[ -z "$pgid" ]]; then
+		info "bridge 不是 kipsel 启的,拒绝停止(如需停止请用 systemctl 或手动 kill)"
+		flock -u 9; exec 9>&-
+		return 0
+	fi
+	if same_process "$pgid" "$start"; then
+		kill -TERM -- "-$pgid" 2>/dev/null || true
+		local i
+		for i in $(seq 1 20); do
+			same_process "$pgid" "$start" || break
+			sleep 0.25
+		done
+		same_process "$pgid" "$start" && kill -KILL -- "-$pgid" 2>/dev/null || true
+	fi
+	rm -f "$SPAWN_RECORD"
+	info "已停止 kipsel 启的 bridge"
+	flock -u 9; exec 9>&-
+}
+
+case "${1:-}" in
+ensure) do_ensure ;;
+release) do_release ;;
+status) do_status ;;
+stop) do_stop ;;
+*)
+	echo "用法: kipsel-bridge {ensure|release|status|stop}" >&2
+	exit 2
+	;;
+esac

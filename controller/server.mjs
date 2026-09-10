@@ -192,7 +192,14 @@ export async function loadConfig(path = process.env.KIPSEL_CONFIG || DEFAULT_CON
     if (model !== null && !/^[A-Za-z0-9._:/-]{1,160}$/.test(model)) {
       throw new ControllerError(500, "invalid-config", "A profile model is invalid");
     }
-    profiles[name] = { model, vision: profile.vision === true };
+    const persona = profile.persona === undefined ? null : String(profile.persona);
+    if (persona !== null && !isAbsolute(persona)) {
+      throw new ControllerError(500, "invalid-config", `profiles.${name}.persona must be an absolute file path`);
+    }
+    if (persona !== null) {
+      await regularFile(persona, `profiles.${name}.persona`);
+    }
+    profiles[name] = { model, vision: profile.vision === true, persona };
   }
   if (Object.keys(profiles).length === 0) {
     throw new ControllerError(500, "invalid-config", "At least one profile is required");
@@ -530,6 +537,7 @@ export async function createController(config, dependencies = {}) {
       "regular",
     ];
     if (profile.model) args.push("--model", profile.model);
+    if (profile.persona) args.push("--append-system-prompt", profile.persona);
 
     const childEnvironment = {
       ...environment,
@@ -759,7 +767,11 @@ export async function createController(config, dependencies = {}) {
     if (route === "GET /v1/projects") {
       return sendJson(response, 200, {
         projects: Object.keys(config.projects),
-        profiles: Object.entries(config.profiles).map(([name, profile]) => ({ name, vision: profile.vision })),
+        profiles: Object.entries(config.profiles).map(([name, profile]) => ({
+          name,
+          vision: profile.vision,
+          persona: profile.persona !== null,
+        })),
         defaults: config.defaults,
       });
     }

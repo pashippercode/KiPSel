@@ -286,6 +286,30 @@ test("start uses an argv array, keeps internal token out of argv, and enforces s
   assert.equal(second.json.error, "session-limit");
 });
 
+test("profile persona injects --append-system-prompt into spawn args", async (t) => {
+  const context = await fixture({
+    profiles: {
+      plain: { model: null, vision: false, persona: null },
+      persona: { model: null, vision: true, persona: "/test/KiPSel/prompts/persona-remote-qq.md" },
+    },
+    defaults: { project: "demo", profile: "plain" },
+  });
+  t.after(() => context.close());
+
+  const started = await startSession(context, "alpha", "persona");
+  assert.equal(started.response.status, 200);
+  const call = context.spawns[0];
+  const flagIndex = call.args.indexOf("--append-system-prompt");
+  assert.notEqual(flagIndex, -1);
+  assert.equal(call.args[flagIndex + 1], "/test/KiPSel/prompts/persona-remote-qq.md");
+
+  const projects = await request(context.external, "/v1/projects", { bearer: context.bearer });
+  const personaEntry = projects.json.profiles.find((profile) => profile.name === "persona");
+  const plainEntry = projects.json.profiles.find((profile) => profile.name === "plain");
+  assert.equal(personaEntry.persona, true);
+  assert.equal(plainEntry.persona, false);
+});
+
 test("submit, internal poll/ack/result, and external result return the real result", async (t) => {
   const context = await fixture();
   t.after(() => context.close());
