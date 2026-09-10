@@ -37,13 +37,31 @@ wait_until() { # wait_until <描述> <超时秒> <命令...>
 holders_are() { [[ "$(holders)" == "$1" ]]; }
 owned()      { [[ -n "$(pgid_of)" ]]; }
 not_owned()  { [[ -z "$(pgid_of)" ]]; }
+no_bridge_groups() { [[ "$(bridge_groups)" == "0" ]]; }
 kill_port()  { fuser -k -n tcp "$PORT" >/dev/null 2>&1 || true; }
+# 注意:kill_port 是 best-effort。在 PID namespace 隔离的沙箱里,fuser 无法通过
+# /proc/*/fd 反查 socket 持有者,会静默失败。所以任何"必须没有 bridge 在跑"
+# 的前置条件都不能依赖它,要改用独立端口 + 独立状态目录(见用例 7 / 9)。
 
 health()  { curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok":true'; }
 holders() { ls "$STATE/holders" 2>/dev/null | wc -l | tr -d ' '; }
 pgid_of() { [[ -f "$STATE/bridge.owner" ]] && sed -n 's/^pgid=//p' "$STATE/bridge.owner" | head -1 || echo ""; }
-# 一条 bridge 在命令行上有 sh / tsx / node 三层匹配,所以按**进程组**数计。
-bridge_groups() { ps -eo pgid,cmd | grep "[s]erver\.ts" | awk '{print $1}' | sort -u | wc -l | tr -d ' '; }
+# 统计属于**本次运行**的 bridge 进程组。
+#
+# 早先这里用全局 `ps | grep server.ts`,在沙箱里不可靠:沙箱自身的 bwrap/bash
+# 都以 pgid 0 出现,且上一次调用残留的 bridge 进程也会被算进来,导致计数
+# 随机多出 1~2 个。改成按 /proc/<pid>/environ 精确匹配本次的 STATE_DIR
+# (bridge 由 ensure 派生,完整继承该变量),并排除脚本自身的 pgid。
+own_pgid() { ps -o pgid= -p $$ 2>/dev/null | tr -d ' '; }
+bridge_groups() {
+	local me pg
+	me="$(own_pgid)"
+	for d in /proc/[0-9]*; do
+		tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -qF "KIPSEL_STATE_DIR=$STATE" || continue
+		pg="$(ps -o pgid= -p "${d#/proc/}" 2>/dev/null | tr -d ' ')"
+		[[ -n "$pg" && "$pg" != "$me" ]] && echo "$pg"
+	done | sort -u | wc -l | tr -d ' '
+}
 
 # 起一个"长命会话":ensure 后一直活着,直到出现释放标志文件。
 # 这模拟真实的 kipsel TUI 会话(而不是 bash -c 那样立刻退出)。
@@ -128,29 +146,39 @@ check "死持有者被清理后计数" "$n" "0"
 
 echo
 echo "=== 7. bridge 目录缺失时优雅降级 ==="
-# 必须先确认没有任何 bridge 在跑,否则 ensure 会走"复用"分支而不是降级分支。
-kill_port
-for i in $(seq 1 20); do health || break; sleep 0.5; done
-out="$(KIPSEL_BRIDGE_DIR=/nonexistent/bridge "$CTL" ensure 2>&1)"; rc=$?
+# 降级分支只在"当前没有健康 bridge"时才走到。前面的用例可能留下仍在跑的
+# bridge,而本环境里 fuser 无法反查 socket 持有者(PID namespace 隔离),
+# 杀不干净 —— 所以这里换到独立端口 + 独立状态目录,让前置条件确定成立。
+S7="$STATE/case7"; P7=9478
+out="$(KIPSEL_STATE_DIR="$S7" PIPILOT_PORT="$P7" KIPSEL_BRIDGE_DIR=/nonexistent/bridge "$CTL" ensure 2>&1)"; rc=$?
 check "退出码仍为 0" "$rc" "0"
-[[ "$out" == *"跳过 bridge"* ]] && ok "给出跳过原因" || bad "缺少跳过提示: $out"
+[[ "$out" == *"跳过 bridge"* ]] && ok "给出跳过原因" || bad "缺少跳过提示: [$out]"
 
 echo
 echo "=== 8. stop 拒绝停止非自己启的 bridge ==="
-# 清掉归属记录以模拟"bridge 不是 kipsel 启的"这一前提(step 6 强杀会话
-# 留下了残留记录)。
-rm -f "$STATE/bridge.owner"
-out="$("$CTL" stop 2>&1)"
+# 独立状态目录 = 没有归属记录,等价于"bridge 不是 kipsel 启的"。
+S8="$STATE/case8"
+out="$(KIPSEL_STATE_DIR="$S8" "$CTL" stop 2>&1)"
 [[ "$out" == *"拒绝停止"* ]] && ok "拒绝停止外部 bridge" || bad "stop 行为异常: [$out]"
 
 echo
 echo "=== 9. 未安装依赖时拒绝启动 ==="
-FAKE="$STATE/fake-bridge"; mkdir -p "$FAKE"
-out="$(KIPSEL_BRIDGE_DIR="$FAKE" "$CTL" ensure 2>&1)"
+S9="$STATE/case9"; P9=9479
+FAKE="$S9/fake-bridge"; mkdir -p "$FAKE"
+out="$(KIPSEL_STATE_DIR="$S9" PIPILOT_PORT="$P9" KIPSEL_BRIDGE_DIR="$FAKE" "$CTL" ensure 2>&1)"
 [[ "$out" == *"未安装依赖"* ]] && ok "检测到缺依赖并跳过" || bad "缺依赖处理异常: [$out]"
 
 echo
-kill_port
+echo "=== 10. 收尾:套件不留下自己启的 bridge ==="
+# 用例 6 强杀会话后 bridge 仍在跑(这正是要验证的自愈行为),用例 7/9 用的是
+# 独立状态目录,所以主 STATE 的 bridge 会留到最后。必须显式收掉,否则同一
+# shell 里再跑一次时,残留进程会污染计数与健康检查。
+"$CTL" stop >/dev/null 2>&1 || true
+wait_until "bridge 进程组回收" 15 no_bridge_groups
+check "无残留 bridge 进程组" "$(bridge_groups)" "0"
+health && bad "端口仍被占用" || ok "端口已释放"
+
+echo
 rm -rf "$STATE"
 echo "════════════════════════════════"
 echo "PASS=$pass  FAIL=$fail"

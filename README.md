@@ -157,7 +157,7 @@ docs/                    文档与存档
 ## 验证
 
 ```bash
-bash launcher/test-bridge-lifecycle.sh    # 19 项：单例/引用计数/外部不误杀/降级/孤儿回收
+bash launcher/test-bridge-lifecycle.sh    # 21 项：单例/引用计数/外部不误杀/降级/孤儿回收/收尾自清理
 ```
 
 `pi-fork/` 的验证方式见 `pi-fork/README.md`。
