@@ -53,7 +53,50 @@ kipselc             # 同上的快捷 shell 函数（定义在 ~/.bashrc.pi）
 
 相位状态在状态栏可见，`workflow(action=phase_set)`（旧名 `audit_set_phase`）负责切换。
 
-### bridge 生命周期安全
+## 子代理
+
+主代理不必独自干完所有活。`subagent` 把任务派给**上下文隔离**的子进程——子代理的探索、试错和中间日志都不会污染主会话的上下文窗口，只把结论带回来。
+
+### 六个专职代理
+
+| 代理 | 职责 | 写权限 |
+|---|---|---|
+| `scout` | 快速代码勘察，产出可交接的压缩上下文 | 无（只读） |
+| `planner` | 从需求与上下文生成实施计划 | 无（只读） |
+| `prompt-critic` | 把模糊任务改写成带验收标准的可执行规格 | 无（只读） |
+| `worker` | 通用执行代理，完整能力 | 批准后写 |
+| `reviewer` | 代码审查：质量与安全 | 无（只读 diff 审查） |
+| `capture-lesson` | 把验证过的经验追加进 `knowledge/<scope>.md` | 受相位硬拦截限制 |
+
+只读代理的 `tools` 里根本没有 `edit`/`write`，所以"只读"是能力层面的约束，不是靠提示词自觉。`capture-lesson` 是例外：它有写工具，但 `capture` 相位会硬拦截 `~/.pi/agent/knowledge` 之外的任何写入。
+
+### 三种编排形态
+
+```js
+subagent({ agent: "scout", task: "..." })                    // 单发
+subagent({ tasks: [{agent, task, scope}, ...] })             // 并行
+subagent({ chain: [{agent, task}, {agent, task}] })          // 串行，后一步用 {previous}
+```
+
+**写冲突由 scope 调度器挡住**：并行任务若声明了重叠的 `scope` 根，会被自动串行化——并行度换不来竞态。确实不写盘的任务用 `readOnly: true` 显式声明，它们可以共享空 scope。
+
+### 后台作业
+
+`background: true` 让子代理脱离当前轮次运行，立即返回 job id，完成时以 follow-up 回传；`subagent_jobs` 查状态与摘要，`subagent_cancel` 取消。默认是前台（`false`）——只有当你不需要本轮就拿到结果时才值得后台化。
+
+### 回传通道
+
+子代理用 `deliver` 主动把 blocker、关键发现或提问推回主会话，而不是等主代理来问。`urgent: true` 会立即唤起一轮 follow-up，用在"计划行不通""撞上受保护文件""依赖缺失"这类需要主代理马上反应的情况。
+
+### 编排辅助
+
+- `optimize_prompt`：委托前把冗长模糊的任务压成清晰规格，可对每个任务自动执行（`optimizePrompt: true`）。
+- `subagent_set_model`：某个代理的模型 429/不可用时，临时改道到可用模型；作用域为进程级，`/reload` 后仍生效，进程退出即清除。
+- 每个任务都记账 `input` / `output` / `cacheRead` / `cacheWrite` / `cost` / `turns`。
+
+模型分配在 `subagent-config.json`（`defaultModel`、`reviewModel`、`compactionModel`），也可由各 agent 的 frontmatter 覆盖。
+
+## bridge 生命周期安全
 
 `kipsel` 同时管一个 PiPilot bridge，它按四条规则约束自己：
 
@@ -89,7 +132,7 @@ chmod +x ~/.local/bin/kipsel ~/.local/bin/kipsel-bridge
 
 ### pi 定制层
 
-`pi-fork/` 是 `~/.pi/agent` 的发行包（extensions / prompts / agents / themes），提供上面那套门控：
+`pi-fork/` 是 `~/.pi/agent` 的发行包（extensions / prompts / agents / themes / knowledge），提供上面的相位门控、六个专职代理与主题：
 
 ```bash
 cd pi-fork

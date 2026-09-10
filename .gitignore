@@ -61,6 +61,8 @@ temp/
 *.backup
 *.orig
 *.rej
+# 带时间戳的备份残渣(如 foo.md.bak-20260825-051400):上面的 *.bak 匹配不到
+*.bak-*
 
 # Keep distributable examples/templates
 !*.example

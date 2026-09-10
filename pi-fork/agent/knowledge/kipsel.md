@@ -1,15 +1,15 @@
 # KiPSel knowledge（AstrBot ↔ 可见 pi TUI 桥接）
 
-## 2026-08-14: 系统部署完成，位置与运维入口
+## 系统部署：位置与运维入口
 
-1. 源码树 `/home/xubuntu/Projects/KiPSel`（非 git 仓库；`.git` 是受保护路径，无法仓库化）。三层：`controller/`（Node 22，无依赖）、`tui-extension/`（pi -e 扩展，strip-types 可运行）、`astrbot_plugin_kipsel/`（已部署到 kk 服务器）。
+1. 源码树 `~/Projects/KiPSel`。三层：`controller/`（Node 22，无依赖）、`tui-extension/`（pi -e 扩展，strip-types 可运行）、`astrbot_plugin_kipsel/`（部署到远端 AstrBot 宿主）。
 2. Controller 常驻：`systemctl --user status kipsel-controller`（单元文件 `~/.config/systemd/user/kipsel-controller.service`）。运行配置 `~/.config/kipsel/controller.json` + `bearer`（均 0600；bearer 只存哈希于配置）。外部 API 监听私网地址（Bearer + 来源白名单），内部 API `127.0.0.1:8788`（每会话随机 token）。
 3. 本地冒烟全通：可见 xterm → heartbeat(running) → 任务完成回收真实回复 → abort=interrupted → stop 关窗；`--no-session` 确认无会话落盘。
 4. **远端已迁移**：生产服务器为 `ssh <astrbot-host>`（root SSH，容器 astrbot + snowluma 都在跑）；旧服务器已废弃不要动。controller `allowedSources` 只保留本机与当前生产机的私网地址。
 5. **新插件首次加载的正确姿势**（server-maintenance skill 修复章）：不要 docker restart——用 dashboard `POST /api/v1/plugins/install/upload`（multipart zip，临时 JWT 由容器内 `cmd_config.json` 的 `dashboard.jwt_secret` 现铸，pyjwt 容器里有），定向安装+加载，不动其他 40+ 插件。注意：`/plugins/{name}/reload` 对**从未加载过**的插件会退化成 reload-all，别用它做首次加载。已在 AstrBot v4.27.3 实证。
 6. 生产机备份：`<backup-dir>/astrbot-config-pre-kipsel-<ts>.tar.gz`；误传旧服务器的插件保留未清理（用户指示不动旧机）。
 
-## 关键 API 事实（以本机 pi 0.84.1 实证为准）
+## 关键 API 事实（以本机 pi 0.84.x 实证为准）
 
 - `pi --no-session` + `--session-id <uuid>` 兼容：`SessionManager.inMemory(cwd, {id})`，不落盘且 `getSessionId()` 保留传入 id。用于「可见 TUI 但隐私不落盘」。
 - 结果采集：marker（custom message）→ 等 `agent_settled`（`message_end` 时会话可能未持久化/未落定）→ 从 marker 到下一个 user 边界 harvest assistant 文本。
@@ -20,6 +20,6 @@
 
 ## 运维注意
 
-- lavenda 模型通道不稳定：zen-deepseek-v4-flash / zen-mimo-v2.5 / laguna-s-2.1-free 会整组 503 `model_not_found`；默认 `gpt-5.6-sol` 可用（402 配额 ~22:33 CST 重置）。冒烟测试前先 `pi --no-session -p "..."` 探活。
+- 模型通道不稳定：部分 zen / laguna 型号会整组 503 `model_not_found`；主力型号偶发 402 配额（定期重置）。冒烟测试前先 `pi --no-session -p "..."` 探活。
 - 残留低概率竞态（review 已接受）：内网故障 ~80s 后 resume 重接纳的任务若 agent 已无输出会被判 `missing-assistant-result`；abort 与 dispatch 的极窄窗口已加 localInterruption 守卫。
-- 测试基线：controller 12/12、TUI core 9/9、插件纯逻辑 43/43（main.py 依赖 astrbot 包，只能远端集成验证）。
+- 测试基线：controller 21/21、TUI core 9/9、插件纯逻辑 49/49（main.py 依赖 astrbot 包，只能远端集成验证）。
