@@ -51,6 +51,7 @@
 ./install.sh --dry-run  # 只看将要执行的操作
 ```
 > 注意：`settings.json` 与 `subagent-config.json` 是 if-missing 策略；已有安装需 `./install.sh --force` 才会应用本次主题/模型变更（--force 同时会覆盖 knowledge/，请先确认备份）。
+> `settings.json` 不固定 `npmCommand`：pi 默认从自身安装布局推断 npm（win32 走 win32 解析），如需 mise/asdf 包装请在本机 settings.json 自行加，不要入库（曾硬编码作者 Linux 路径 `/home/xubuntu/.local/node22/.../npm` 导致其他机器上 `pi install` 找不到 npm）。
 
 安装后在 pi TUI 里执行 `/reload`。被覆盖的文件会先备份到 `~/.pi/agent.backup.<时间戳>/`，回滚即把备份拷回 `~/.pi/agent/`。
 

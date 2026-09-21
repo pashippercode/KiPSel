@@ -67,9 +67,6 @@
     "autoResize": true,
     "blockImages": false
   },
-  "npmCommand": [
-    "/home/xubuntu/.local/node22/node-v22.20.0-linux-x64/bin/npm"
-  ],
   "markdown": {
     "codeBlockIndent": "  ",
     "mermaid": "final"
