@@ -7,7 +7,7 @@
 ```
 官方 pi 0.84.x（@earendil-works/pi-*，不动）
   └─ KiPSel 定制层（本目录 agent/，安装到 ~/.pi/agent/）
-       ├─ extensions/   工作流门控、子代理、计划模式、投递通道、提示词优化等
+       ├─ extensions/   工作流门控、子代理、计划模式、投递通道、提示词优化、pi-grok(xAI OAuth) 等
        ├─ prompts/      WORKFLOW MODE 及各步骤提示词（work.md 等）
        ├─ agents/       scout / planner / worker / reviewer / prompt-critic / capture-lesson
        ├─ knowledge/    会话经验库（pi / locatrix / generic / kipsel）
@@ -32,6 +32,7 @@
 | `themes/kipfel.json` | Kipfel 橙棕主题：51 键完整主题（accent 橙 `#d9822b`、棕色边框、暖白文字），settings.json `"theme": "kipfel"` 启用 |
 | `kipfel-ui/` | Kipfel 像素画启动 header（`setHeader`）+ Kipfel 风味 working message；全程 try/catch 防御：渲染异常回退为简版单行标题，注册失败则保留内置 header |
 | `claude-status-imitating.ts` | 通用 Claude Code 风格 working 指示器（不注册 tool/command，不接入 QQ/controller 监测）。按当前工具推断动作并带上对象：`grep foo.*` → `Discerning foo.*...`，`read a.ts` → `Perusing a.ts...`，思考期仅动词。活动时覆盖 kipfel-ui 的静态揉面文案，空闲后恢复默认 |
+| `pi-grok/` | xAI OAuth provider（vendored，**源仓库 [stnly/pi-grok](https://github.com/stnly/pi-grok) v0.10.1，MIT © stnly**，经镜像仓 [pashippercode/pi-grok](https://github.com/pashippercode/pi-grok) 引入）：在 pi 里用 x.com Premium / SuperGrok 订阅，OAuth 登录、自动刷新、模型目录实时发现，`/xai-status` `/xai-privacy` `/xai-usage` 命令 |
 
 子代理模型：`111/gpt-5.6-luna`（各 agent frontmatter + `subagent-config.json` defaultModel）；`luna`、`lavenda/luna`、`111/luna`、`gpt-5.6-luna` 会解析为 `111/gpt-5.6-luna`。提示词优化器模型：`subagent-config.json` 的 `promptOptimizerModel`（独立可选，每次调用可用 `model` 参数覆盖）。
 

@@ -13,17 +13,32 @@
 #   status   打印当前状态(持有者、归属、健康)
 #   stop     强制停止(仅当我们拥有它);用于人工清理
 #
+#   源码目录缺失/未装依赖时,自动回退到独立二进制:
+#   从 pashippercode/pi-pilot Release 下载 linux-x64 二进制(sha256 校验),
+#   缓存到 $XDG_DATA_HOME/kipsel/pipilot-bridge。
+#
 # 环境覆盖(便于泛用):
-#   KIPSEL_BRIDGE_DIR  bridge 目录(默认 ~/Projects/pi_pilot/bridge)
-#   KIPSEL_STATE_DIR   状态目录(默认 $XDG_STATE_HOME/kipsel 或 ~/.local/state/kipsel)
-#   PIPILOT_PORT       健康检查端口(默认 9377)
-#   KIPSEL_BRIDGE_LOG  日志路径(默认 $KIPSEL_STATE_DIR/bridge.log)
+#   KIPSEL_BRIDGE_DIR     bridge 目录(默认 ~/Projects/pi_pilot/bridge)
+#   KIPSEL_STATE_DIR      状态目录(默认 $XDG_STATE_HOME/kipsel 或 ~/.local/state/kipsel)
+#   PIPILOT_PORT          健康检查端口(默认 9377)
+#   KIPSEL_BRIDGE_LOG     日志路径(默认 $KIPSEL_STATE_DIR/bridge.log)
+#   KIPSEL_BRIDGE_BIN     独立二进制路径(默认 $KIPSEL_BRIDGE_BIN_DIR/pipilot-bridge)
+#   KIPSEL_BRIDGE_BIN_DIR 二进制缓存目录(默认 $XDG_DATA_HOME/kipsel 或 ~/.local/share/kipsel)
+#   KIPSEL_BRIDGE_URL     二进制下载地址(默认 pashippercode/pi-pilot v0.1.0 资产)
+#   KIPSEL_BRIDGE_SHA256  二进制 sha256 期望值(默认与上述 Release 资产一致)
+#   KIPSEL_BRIDGE_NO_DOWNLOAD=1  禁用自动下载(离线/测试用;已有二进制仍可用)
 set -euo pipefail
 
 BRIDGE_DIR="${KIPSEL_BRIDGE_DIR:-$HOME/Projects/pi_pilot/bridge}"
 STATE_DIR="${KIPSEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/kipsel}"
 PORT="${PIPILOT_PORT:-9377}"
 LOG_FILE="${KIPSEL_BRIDGE_LOG:-$STATE_DIR/bridge.log}"
+
+# ── 独立二进制回退(发版仓 pashippercode/pi-pilot,源仓库 ccch1mneyyy/pi_pilot,MIT) ──
+BIN_DIR="${KIPSEL_BRIDGE_BIN_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/kipsel}"
+BRIDGE_BIN="${KIPSEL_BRIDGE_BIN:-$BIN_DIR/pipilot-bridge}"
+BRIDGE_BIN_URL="${KIPSEL_BRIDGE_URL:-https://github.com/pashippercode/pi-pilot/releases/download/v0.1.0/pipilot-bridge-linux-x64}"
+BRIDGE_BIN_SHA256="${KIPSEL_BRIDGE_SHA256:-b17b6247493bfafb17c75a7dbfa9c84085b197ee5eed482d1906d37e6942bdf6}"
 
 HOLDERS_DIR="$STATE_DIR/holders"
 MUTEX="$STATE_DIR/mutex"
@@ -88,6 +103,116 @@ owner_field() {
 	return 0
 }
 
+# ── 拉起途径 ────────────────────────────────────────────────────────────
+
+# 在指定目录 setsid 拉起 bridge 命令并等待健康;
+# 成功则登记归属(进程组即 setsid 组长,退出可整组回收)。
+# 源码树的 npm start 会派生出 npm → sh → tsx → node 四层,
+# 只杀 launcher 会留下孤儿占着端口,所以必须整组收。
+spawn_bridge() { # spawn_bridge <workdir> <cmd...>
+	local dir="$1"; shift
+	mkdir -p "$(dirname "$LOG_FILE")"
+	(
+		cd "$dir"
+		setsid nohup "$@" >>"$LOG_FILE" 2>&1 &
+		echo $! >"$STATE_DIR/.spawned_pid"
+	)
+	local spawned
+	spawned="$(cat "$STATE_DIR/.spawned_pid" 2>/dev/null || echo)"
+	rm -f "$STATE_DIR/.spawned_pid"
+
+	# 等健康检查通过(最多 ~20s);进程提前死掉就立即退出等待。
+	local i
+	for i in $(seq 1 40); do
+		if bridge_healthy; then break; fi
+		if [[ -n "$spawned" ]] && ! same_process "$spawned" "$(proc_start_time "$spawned")"; then
+			info "bridge 进程提前退出(启动即失败),详见 $LOG_FILE"
+			break
+		fi
+		sleep 0.5
+	done
+
+	if bridge_healthy && [[ -n "$spawned" ]]; then
+		# 记录归属:pgid 即 setsid 出来的组长 pid
+		{
+			echo "pgid=$spawned"
+			echo "start=$(proc_start_time "$spawned")"
+		} >"$SPAWN_RECORD"
+		return 0
+	fi
+	if ! bridge_healthy; then
+		info "bridge 未能在超时内就绪,详见 $LOG_FILE"
+	fi
+	# 我们起却没能就绪：整组回收，别留孤儿占端口。
+	if [[ -n "$spawned" ]]; then
+		local spawned_start
+		spawned_start="$(proc_start_time "$spawned")"
+		if same_process "$spawned" "$spawned_start"; then
+			kill -TERM -- "-$spawned" 2>/dev/null || true
+		fi
+	fi
+	return 1
+}
+
+# 途径一:源码树(开发机):npm start → tsx。
+spawn_from_source() {
+	if [[ ! -d "$BRIDGE_DIR" ]]; then
+		info "源码目录不在:找不到 $BRIDGE_DIR"
+		return 1
+	fi
+	if [[ ! -x "$BRIDGE_DIR/node_modules/.bin/tsx" ]]; then
+		info "$BRIDGE_DIR 未安装依赖(在该目录 npm install)"
+		return 1
+	fi
+	spawn_bridge "$BRIDGE_DIR" npm start
+}
+
+# 途径二:独立二进制(发布自 pashippercode/pi-pilot,源仓库 ccch1mneyyy/pi_pilot)。
+# 无 Node/源码需求;不存在时自动下载并 sha256 校验。
+fetch_bridge_bin() {
+	[[ -x "$BRIDGE_BIN" ]] && return 0
+	if [[ "${KIPSEL_BRIDGE_NO_DOWNLOAD:-0}" == "1" ]]; then
+		info "KIPSEL_BRIDGE_NO_DOWNLOAD=1,不自动下载;$BRIDGE_BIN 不存在"
+		return 1
+	fi
+	case "$(uname -s)-$(uname -m)" in
+		Linux-x86_64) ;;
+		*) info "独立二进制只提供 linux-x64,当前平台 $(uname -s)-$(uname -m) 无匹配资产"; return 1 ;;
+	esac
+	command -v curl >/dev/null 2>&1 || { info "未找到 curl,无法下载 bridge 二进制"; return 1; }
+	mkdir -p "$BIN_DIR"
+	info "正在下载 PiPilot bridge 独立二进制 → $BRIDGE_BIN"
+	if ! curl -fL --retry 2 --max-time 300 -o "$BRIDGE_BIN.tmp" "$BRIDGE_BIN_URL"; then
+		rm -f "$BRIDGE_BIN.tmp"
+		info "bridge 二进制下载失败:$BRIDGE_BIN_URL"
+		return 1
+	fi
+	if ! echo "$BRIDGE_BIN_SHA256  $BRIDGE_BIN.tmp" | sha256sum --check - >/dev/null 2>&1; then
+		rm -f "$BRIDGE_BIN.tmp"
+		info "bridge 二进制 sha256 校验失败,已丢弃"
+		return 1
+	fi
+	chmod +x "$BRIDGE_BIN.tmp"
+	mv -f "$BRIDGE_BIN.tmp" "$BRIDGE_BIN"
+}
+
+spawn_from_release_bin() {
+	fetch_bridge_bin || return 1
+	# bridge 需要 PIPILOT_TOKEN 给手机端配对;缺省时生成一次并持久化,
+	# 免得 bridge 每次重启后手机端都要重新配对。
+	if [[ -z "${PIPILOT_TOKEN:-}" ]]; then
+		local tok_file="$STATE_DIR/bridge-token"
+		if [[ ! -s "$tok_file" ]]; then
+			(umask 077; head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 >"$tok_file")
+			info "已生成 PIPILOT_TOKEN → $tok_file(手机端凭它连接 bridge)"
+		fi
+		PIPILOT_TOKEN="$(cat "$tok_file")"
+	fi
+	export PIPILOT_TOKEN
+	# 二进制的 cwd 会成为 headless pi 会话的默认工作目录,固定到 $HOME。
+	spawn_bridge "$HOME" "$BRIDGE_BIN"
+}
+
 # ── ensure ──────────────────────────────────────────────────────────────
 
 do_ensure() {
@@ -104,41 +229,10 @@ do_ensure() {
 		# 已有 bridge —— 复用,不重复起。它可能是我们的,也可能是外部的;
 		# 归属由 SPAWN_RECORD 决定,和持有者登记分开记录。
 		:
-	elif [[ -d "$BRIDGE_DIR" ]]; then
-		if [[ ! -x "$BRIDGE_DIR/node_modules/.bin/tsx" ]]; then
-			info "跳过 bridge:$BRIDGE_DIR 未安装依赖(在该目录 npm install)"
-		else
-			mkdir -p "$(dirname "$LOG_FILE")"
-			# setsid:让 npm 成为新进程组组长,退出时能整组清理
-			# (npm → sh → tsx → node 四层,只杀 launcher 会留下孤儿占着端口)。
-			(
-				cd "$BRIDGE_DIR"
-				setsid nohup npm start >>"$LOG_FILE" 2>&1 &
-				echo $! >"$STATE_DIR/.spawned_pid"
-			)
-			local spawned
-			spawned="$(cat "$STATE_DIR/.spawned_pid" 2>/dev/null || echo)"
-			rm -f "$STATE_DIR/.spawned_pid"
-
-			# 等健康检查通过(最多 ~20s)
-			local i
-			for i in $(seq 1 40); do
-				if bridge_healthy; then break; fi
-				sleep 0.5
-			done
-
-			if bridge_healthy && [[ -n "$spawned" ]]; then
-				# 记录归属:pgid 即 setsid 出来的组长 pid
-				{
-					echo "pgid=$spawned"
-					echo "start=$(proc_start_time "$spawned")"
-				} >"$SPAWN_RECORD"
-			elif ! bridge_healthy; then
-				info "bridge 未能在超时内就绪,详见 $LOG_FILE"
-			fi
-		fi
+	elif spawn_from_source || spawn_from_release_bin; then
+		:
 	else
-		info "跳过 bridge:找不到 $BRIDGE_DIR"
+		info "跳过 bridge:源码目录与独立二进制均不可用(bridge 缺失不影响 kipsel 本体)"
 	fi
 
 	# 登记持有者(无论 bridge 是否可用,登记都可安全注销)

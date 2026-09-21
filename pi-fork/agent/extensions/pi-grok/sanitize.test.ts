@@ -1,0 +1,498 @@
+import { describe, expect, it } from "vitest";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { sanitizePayload } from "./sanitize.js";
+
+function basePayload(over: Record<string, unknown> = {}): Record<string, unknown> {
+	return { model: "grok-4.5", input: [{ role: "user", content: "hi" }], ...over };
+}
+
+// ─── Reasoning effort ────────────────────────────────────────────────────────
+
+describe("sanitizePayload reasoning effort", () => {
+	describe("effort-capable model (grok-4.5)", () => {
+		it("preserves minimal and strips summary", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "minimal", summary: "auto" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "minimal" });
+		});
+
+		it("keeps low and strips summary", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "low", summary: "auto" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "low" });
+		});
+
+		it("keeps medium and strips summary", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "medium", summary: "auto" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "medium" });
+		});
+
+		it("keeps high", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "high", summary: "auto" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "high" });
+		});
+
+		it("keeps xhigh", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "xhigh", summary: "auto" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "xhigh" });
+		});
+
+		it("leaves effort unchanged when summary is already absent", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "low" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "low" });
+		});
+
+		it("honors a provider-qualified model id", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "low", summary: "auto" } },
+				"xai-oauth/grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "low" });
+		});
+
+		// Agreement contract: the host's thinkingLevelMapFor hides "off" for
+		// effort-capable models, so "none" never reaches the wire. The
+		// sanitizer does NOT strip "none" itself; the map is the sole gate.
+		// This pins that contract: if "none" ever appears here, it is a
+		// caller bug, not something the sanitizer silently fixes.
+		it("passes effort 'none' through unchanged (the map hides off, not the sanitizer)", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "none" } },
+				"grok-4.5",
+			);
+			expect(p.reasoning).toEqual({ effort: "none" });
+		});
+	});
+
+	describe("non-effort model", () => {
+		it("drops reasoning entirely regardless of effort", () => {
+			const p = sanitizePayload(
+				{ ...basePayload(), reasoning: { effort: "low", summary: "auto" } },
+				"grok-4.20-0309-non-reasoning",
+			);
+			expect(p.reasoning).toBeUndefined();
+		});
+	});
+
+	it("leaves the payload untouched when reasoning is absent", () => {
+		const p = sanitizePayload(basePayload(), "grok-4.5");
+		expect(p.reasoning).toBeUndefined();
+		expect(p.input).toBeDefined();
+	});
+});
+
+// ─── Input array quirks ──────────────────────────────────────────────────────
+
+describe("sanitizePayload input array", () => {
+	it("strips replayed reasoning items", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{ type: "reasoning", content: "should be dropped" },
+					{ role: "user", content: "keep" },
+				],
+			},
+			"grok-4.5",
+		);
+		const input = p.input as Array<Record<string, unknown>>;
+		expect(input).toHaveLength(1);
+		expect(input[0]).toMatchObject({ role: "user" });
+	});
+
+	it("drops items with empty-string content", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{ role: "user", content: "" },
+					{ role: "user", content: "keep" },
+				],
+			},
+			"grok-4.5",
+		);
+		const input = p.input as Array<Record<string, unknown>>;
+		expect(input).toHaveLength(1);
+		expect((input[0] as any).content).toBe("keep");
+	});
+
+	it("moves leading system messages into top-level instructions", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{ role: "system", content: "be brief" },
+					{ role: "developer", content: "use tabs" },
+					{ role: "user", content: "hi" },
+				],
+			},
+			"grok-4.5",
+		);
+		const input = p.input as Array<Record<string, unknown>>;
+		expect(input.every((m) => (m as any).role === "user")).toBe(true);
+		expect(p.instructions).toBe("be brief\n\nuse tabs");
+	});
+
+	it("stops migrating at the first non-system message", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{ role: "system", content: "top" },
+					{ role: "user", content: "mid" },
+					{ role: "system", content: "not moved" },
+				],
+			},
+			"grok-4.5",
+		);
+		const input = p.input as Array<Record<string, unknown>>;
+		expect(input.map((m) => (m as any).role)).toEqual(["user", "system"]);
+		expect(p.instructions).toBe("top");
+	});
+
+	it("merges migrated system text onto an existing instructions field", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				instructions: "base",
+				input: [{ role: "system", content: "added" }],
+			},
+			"grok-4.5",
+		);
+		expect(p.instructions).toBe("base\n\nadded");
+	});
+
+	it("leaves string input untouched", () => {
+		const p = sanitizePayload({ model: "grok-4.5", input: "plain string" }, "grok-4.5");
+		expect(p.input).toBe("plain string");
+	});
+});
+
+// ─── Field rewrites ──────────────────────────────────────────────────────────
+
+describe("sanitizePayload field rewrites", () => {
+	it("rewrites response_format to text.format", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), response_format: { type: "json_object" } },
+			"grok-4.5",
+		);
+		expect(p.text).toEqual({ format: { type: "json_object" } });
+		expect(p.response_format).toBeUndefined();
+	});
+
+	it("does not overwrite an existing text field", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), response_format: { type: "json" }, text: { format: "keep" } },
+			"grok-4.5",
+		);
+		expect(p.text).toEqual({ format: "keep" });
+		expect(p.response_format).toBeDefined();
+	});
+
+	it("ensures reasoning.encrypted_content for a reasoning model", () => {
+		// Without an existing include, it is added.
+		const p = sanitizePayload({ ...basePayload() }, "grok-4.5", undefined, true);
+		expect(p.include).toEqual(["reasoning.encrypted_content"]);
+
+		// An existing include keeps its entries and appends the encrypted marker.
+		const withExisting = sanitizePayload(
+			{ ...basePayload(), include: ["other"] },
+			"grok-4.5", undefined, true,
+		);
+		expect(withExisting.include).toEqual(["other", "reasoning.encrypted_content"]);
+	});
+
+	it("does not duplicate reasoning.encrypted_content when already present", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), include: ["reasoning.encrypted_content"] },
+			"grok-4.5", undefined, true,
+		);
+		expect(p.include).toEqual(["reasoning.encrypted_content"]);
+	});
+
+	it("leaves include untouched for a non-reasoning model", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), include: ["other"] },
+			"grok-4.20-0309-non-reasoning", undefined, false,
+		);
+		expect(p.include).toEqual(["other"]);
+	});
+
+	it("deletes prompt_cache_retention", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), prompt_cache_retention: { key: "x" } },
+			"grok-4.5",
+		);
+		expect(p.prompt_cache_retention).toBeUndefined();
+	});
+
+	it("injects prompt_cache_key from the session id when absent", () => {
+		const p = sanitizePayload(basePayload(), "grok-4.5", "sess-123");
+		expect(p.prompt_cache_key).toBe("sess-123");
+	});
+
+	it("does not overwrite an existing prompt_cache_key", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), prompt_cache_key: "existing" },
+			"grok-4.5",
+			"sess-123",
+		);
+		expect(p.prompt_cache_key).toBe("existing");
+	});
+
+	it("omits prompt_cache_key when no session id is given", () => {
+		const p = sanitizePayload(basePayload(), "grok-4.5");
+		expect(p.prompt_cache_key).toBeUndefined();
+	});
+});
+
+// ─── Image normalization ─────────────────────────────────────────────────────
+
+describe("sanitizePayload image normalization", () => {
+	it("normalizes an https image_url part to input_image", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{
+						role: "user",
+						content: [{ type: "image_url", image_url: { url: "https://x.ai/a.png" } }],
+					},
+				],
+			},
+			"grok-4.5",
+		);
+		const content = (p.input as any[])[0].content as any[];
+		expect(content[0].type).toBe("input_image");
+		expect(content[0].image_url).toBe("https://x.ai/a.png");
+	});
+
+	it("passes http(s) and data URIs through resolved", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{
+						role: "user",
+						content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }],
+					},
+				],
+			},
+			"grok-4.5",
+		);
+		const content = (p.input as any[])[0].content as any[];
+		expect(content[0].image_url).toBe("data:image/png;base64,AAAA");
+		expect(content[0].detail).toBe("auto");
+	});
+
+	it("resolves a local image path to a data URI", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-grok-img-"));
+		const file = join(dir, "pic.png");
+		writeFileSync(file, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+		try {
+			const p = sanitizePayload(
+				{
+					model: "grok-4.5",
+					input: [{ role: "user", content: [{ type: "input_image", image_url: file }] }],
+				},
+				"grok-4.5",
+			);
+			const part = (p.input as any[])[0].content[0];
+			expect(part.type).toBe("input_image");
+			expect(part.image_url).toMatch(/^data:image\/png;base64,/);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("normalizes a {type:'image', data, mimeType} part to input_image with a data URI", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [{ role: "user", content: [{ type: "image", data: "QUJD", mimeType: "image/png" }] }],
+			},
+			"grok-4.5",
+		);
+		const part = (p.input as any[])[0].content[0];
+		expect(part.type).toBe("input_image");
+		expect(part.image_url).toBe("data:image/png;base64,QUJD");
+		expect(part.detail).toBe("auto");
+	});
+});
+
+// ─── function_call_output rewrite ────────────────────────────────────────────
+
+describe("sanitizePayload function_call_output", () => {
+	it("flattens a text-only output array to a string", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{
+						type: "function_call_output",
+						call_id: "c1",
+						output: [{ type: "output_text", text: "line1" }, { type: "output_text", text: "line2" }],
+					},
+				],
+			},
+			"grok-4.5",
+		);
+		const item = (p.input as any[])[0];
+		expect(item.output).toBe("line1\nline2");
+	});
+
+	it("extracts image parts into a follow-up user message", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [
+					{
+						type: "function_call_output",
+						call_id: "c1",
+						output: [
+							{ type: "output_text", text: "done" },
+							{ type: "input_image", image_url: "https://x.ai/a.png" },
+						],
+					},
+				],
+			},
+			"grok-4.5",
+		);
+		const input = p.input as any[];
+		// Original output is text-only now.
+		expect(input[0].output).toBe("done");
+		// A user message carrying the image was appended.
+		const appended = input[input.length - 1];
+		expect(appended.role).toBe("user");
+		expect(appended.content.some((c: any) => c.type === "input_image")).toBe(true);
+	});
+
+	it("uses a placeholder when the output array has no text", () => {
+		const p = sanitizePayload(
+			{
+				model: "grok-4.5",
+				input: [{ type: "function_call_output", call_id: "c1", output: [] }],
+			},
+			"grok-4.5",
+		);
+		expect((p.input as any[])[0].output).toMatch(/no text output/);
+	});
+});
+
+// ─── Non-mutation and non-lossy strip ─────────────────────────────────────
+
+describe("sanitizePayload safety", () => {
+	it("does not mutate the caller's payload object", () => {
+		const original = { ...basePayload(), reasoning: { effort: "low", summary: "auto" } };
+		const snapshot = JSON.parse(JSON.stringify(original));
+		sanitizePayload(original, "grok-4.5");
+		// The caller's object is untouched; only the returned copy is edited.
+		expect(original).toEqual(snapshot);
+	});
+
+	it("preserves unknown reasoning keys when stripping summary", () => {
+		const p = sanitizePayload(
+			{
+				...basePayload(),
+				reasoning: { effort: "high", summary: "auto", exclude: false },
+			},
+			"grok-4.5",
+		);
+		expect(p.reasoning).toEqual({ effort: "high", exclude: false });
+	});
+
+	it("returns a distinct object reference", () => {
+		const original = basePayload();
+		const result = sanitizePayload(original, "grok-4.5");
+		expect(result).not.toBe(original);
+	});
+});
+
+// ─── OpenAI-only field strip + clamps ───────────────────────────────────────
+
+describe("sanitizePayload field parity", () => {
+	it("drops seed, parallel_tool_calls, and service_tier", () => {
+		const p = sanitizePayload(
+			{ ...basePayload(), seed: 42, parallel_tool_calls: true, service_tier: "auto" },
+			"grok-4.5",
+		);
+		expect(p.seed).toBeUndefined();
+		expect(p.parallel_tool_calls).toBeUndefined();
+		expect(p.service_tier).toBeUndefined();
+	});
+
+	it("drops an empty tools array entirely", () => {
+		const p = sanitizePayload({ ...basePayload(), tools: [] }, "grok-4.5");
+		expect(p.tools).toBeUndefined();
+	});
+
+	it("keeps a non-empty tools array", () => {
+		const tool = { type: "function", name: "do_thing" };
+		const p = sanitizePayload({ ...basePayload(), tools: [tool] }, "grok-4.5");
+		expect(p.tools).toEqual([tool]);
+	});
+
+	it("clamps temperature into [0, 2]", () => {
+		expect(sanitizePayload({ ...basePayload(), temperature: 5 }, "grok-4.5").temperature).toBe(2);
+		expect(sanitizePayload({ ...basePayload(), temperature: -1 }, "grok-4.5").temperature).toBe(0);
+		expect(sanitizePayload({ ...basePayload(), temperature: 0.7 }, "grok-4.5").temperature).toBe(0.7);
+	});
+
+	it("clamps top_p into [0, 1]", () => {
+		expect(sanitizePayload({ ...basePayload(), top_p: 2 }, "grok-4.5").top_p).toBe(1);
+		expect(sanitizePayload({ ...basePayload(), top_p: -0.5 }, "grok-4.5").top_p).toBe(0);
+		expect(sanitizePayload({ ...basePayload(), top_p: 0.95 }, "grok-4.5").top_p).toBe(0.95);
+	});
+
+	it("strips enum arrays containing a slash value from tool schemas", () => {
+		const tools = [
+			{
+				type: "function",
+				name: "set_mode",
+				parameters: {
+					type: "object",
+					properties: { mode: { type: "string", enum: ["read/write", "read-only"] } },
+				},
+			},
+		];
+		const p = sanitizePayload({ ...basePayload(), tools } as Record<string, unknown>, "grok-4.5");
+		const modeEnum = (p.tools as any[])[0].parameters.properties.mode.enum;
+		expect(modeEnum).toBeUndefined();
+	});
+
+	it("does not mutate the caller's tool schemas when stripping enums", () => {
+		const original = [
+			{
+				type: "function",
+				name: "set_mode",
+				parameters: {
+					type: "object",
+					properties: { mode: { type: "string", enum: ["read/write", "read-only"] } },
+				},
+			},
+		];
+		const snapshot = JSON.parse(JSON.stringify(original));
+		sanitizePayload({ ...basePayload(), tools: original } as Record<string, unknown>, "grok-4.5");
+		// The caller's tool schema is untouched; only the returned copy loses the enum.
+		expect(original).toEqual(snapshot);
+		expect(original[0].parameters.properties.mode.enum).toEqual(["read/write", "read-only"]);
+	});
+});

@@ -1,0 +1,39 @@
+{
+  "name": "pi-grok",
+  "version": "0.10.1",
+  "description": "Use your SuperGrok subscription in pi with OAuth login, auto-refresh, and live model discovery",
+  "keywords": [
+    "pi-package",
+    "xai",
+    "grok",
+    "oauth",
+    "xai-oauth",
+    "grok-oauth"
+  ],
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.74.0",
+    "@earendil-works/pi-coding-agent": ">=0.74.0"
+  },
+  "author": "stnly",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stnly/pi-grok.git"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

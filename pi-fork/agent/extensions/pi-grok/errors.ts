@@ -1,0 +1,78 @@
+/**
+ * Typed error for xAI OAuth failures.
+ *
+ * Codes allow the login flow and stream handlers to distinguish
+ * retryable failures (network) from fatal ones (revoked refresh token).
+ */
+
+/** Well-known error codes. The const is the runtime value; the type alias
+ * below is the literal union, so `XaiOAuthError.code` narrows to one of
+ * these strings instead of `string`. Add new codes here and the type widens
+ * automatically. */
+export const XaiErrorCode = {
+	/** OIDC discovery failed (network, invalid response, missing jwks_uri, alg list without ES256). */
+	DISCOVERY_FAILED: "discovery_failed",
+	/** Discovery endpoint returned a non-xAI origin. */
+	DISCOVERY_INVALID_ORIGIN: "discovery_invalid_origin",
+	/** Authorization was denied or errored in the browser. */
+	AUTHORIZATION_FAILED: "authorization_failed",
+	/** CSRF state mismatch between request and callback. */
+	STATE_MISMATCH: "state_mismatch",
+	/** Callback did not include an authorization code. */
+	CODE_MISSING: "code_missing",
+	/** Token exchange failed (network, invalid response). */
+	TOKEN_EXCHANGE_FAILED: "token_exchange_failed",
+	/** Token exchange returned an invalid payload. */
+	TOKEN_EXCHANGE_INVALID: "token_exchange_invalid",
+	/** Returned id_token failed claim validation (bad JWT, nonce mismatch, expired). */
+	ID_TOKEN_INVALID: "id_token_invalid",
+	/** id_token signature did not verify against the pinned JWKS. */
+	ID_TOKEN_SIGNATURE_INVALID: "id_token_signature_invalid",
+	/** Refresh token is missing or empty. */
+	REFRESH_MISSING: "refresh_missing",
+	/** Token refresh failed (expired, revoked). */
+	REFRESH_FAILED: "refresh_failed",
+	/** No credentials stored. */
+	AUTH_MISSING: "auth_missing",
+	/** A cli-chat-proxy call (account, privacy, billing) failed. */
+	PROXY_REQUEST_FAILED: "proxy_request_failed",
+	/** Device-code login failed (request rejected, denied, expired, network). */
+	DEVICE_CODE_FAILED: "device_code_failed",
+} as const;
+
+export type XaiErrorCode = (typeof XaiErrorCode)[keyof typeof XaiErrorCode];
+
+export class XaiOAuthError extends Error {
+	constructor(
+		message: string,
+		public readonly code: XaiErrorCode,
+		public readonly reloginRequired = false,
+	) {
+		super(message);
+		this.name = "XaiOAuthError";
+	}
+}
+
+/** Classify an HTTP status from an authenticated xAI endpoint into a
+ * short, user-safe label. Used wherever an error response is surfaced to
+ * the TUI, so raw upstream bodies never leak into the message (they can
+ * carry trace ids, internal endpoint hints, or upstream error context that
+ * the user should not see and the logs should not persist).
+ *
+ * The classifier is intentionally coarse: callers want a label and a hint,
+ * not the upstream's wording. */
+export function classifyHttpStatus(status: number): { code: XaiErrorCode; label: string; fatal: boolean } {
+	if (status === 401 || status === 403) {
+		return { code: XaiErrorCode.PROXY_REQUEST_FAILED, label: "authentication rejected", fatal: true };
+	}
+	if (status === 404) {
+		return { code: XaiErrorCode.PROXY_REQUEST_FAILED, label: "endpoint unavailable", fatal: false };
+	}
+	if (status === 429) {
+		return { code: XaiErrorCode.PROXY_REQUEST_FAILED, label: "rate limited", fatal: false };
+	}
+	if (status >= 500 && status < 600) {
+		return { code: XaiErrorCode.PROXY_REQUEST_FAILED, label: "upstream error", fatal: false };
+	}
+	return { code: XaiErrorCode.PROXY_REQUEST_FAILED, label: `HTTP ${status}`, fatal: false };
+}

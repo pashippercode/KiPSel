@@ -1,0 +1,252 @@
+> [!IMPORTANT]
+> **源仓库 / Source**: [stnly/pi-grok](https://github.com/stnly/pi-grok)（v0.10.1，MIT © stnly），经镜像仓 [pashippercode/pi-grok](https://github.com/pashippercode/pi-grok) vendor 进 KiPSel 的 `pi-fork/agent/extensions/pi-grok/`，由 `pi-fork/install.sh` 安装到 `~/.pi/agent/extensions/`。LICENSE 原样保留。
+
+<p align="center">
+  <img src="assets/pi-grok.jpg" width="720" alt="pi-grok — Pi · Grok">
+</p>
+
+# pi-grok
+
+xAI Grok OAuth provider for [pi](https://pi.dev). Use your SuperGrok subscription with OAuth.
+
+Log in once through your browser. Tokens refresh on their own. No API keys, no billing setup.
+
+Brings Grok models into pi using the official xAI OAuth 2.0 flow with PKCE. Your credentials stay on your machine.
+
+## Requirements
+
+- pi v0.74.0 or later
+- xAI SuperGrok subscription
+
+## Install
+
+```bash
+pi install git:github.com/stnly/pi-grok@v0.10.1
+```
+
+```
+/reload
+```
+
+Or clone manually:
+
+```bash
+git clone https://github.com/stnly/pi-grok ~/.pi/agent/extensions/pi-grok
+```
+
+```
+/reload
+```
+
+## Uninstall
+
+```bash
+pi remove git:github.com/stnly/pi-grok
+```
+
+## Quick start
+
+**1. Log in**
+
+```
+/login
+```
+
+Choose **Use a subscription**, select **xAI (SuperGrok Subscription)**. A verification link and code appear. Open the link, enter the code (or click the prefilled link), and approve on xAI's page. No browser redirect, no local port.
+
+**2. Pick a model**
+
+```
+/model xai-oauth/grok-4.5
+```
+
+`Ctrl+P` cycles models.
+
+## Models
+
+- **grok-4.6**
+- **grok-4.5**
+- **grok-4.3**
+- **grok-composer-2.5-fast**
+- **grok-build**
+- **grok-4.20-0309-reasoning**
+- **grok-4.20-0309-non-reasoning**
+- **grok-4.20-multi-agent-0309**
+
+On login, pi-grok sends every OAuth model through the CLI chat proxy
+(`cli-chat-proxy.grok.com/v1`). The proxy maps each model to its subscription
+variant (for example `grok-4.5` becomes `grok-4.5-build`), so requests ride
+your SuperGrok subscription quota instead of billed API credits. Requests
+carry the client headers the proxy expects (`x-grok-client-version`,
+`x-grok-client-mode`, `X-XAI-Token-Auth`, `x-authenticateresponse`) so it
+recognizes the session.
+
+A background fetch of `cli-chat-proxy.grok.com/v1/models` enriches the model
+list with context windows and surfaces newly released ids, but it does not
+drive routing. The merge reads the proxy field names (`context_window`,
+`name`, `supports_reasoning_effort`) and still accepts the OpenAI names
+(`context_length`, `max_output_tokens`) if they appear. A successful fetch
+re-registers the provider so the picker updates without a second open. A
+second trigger inside the 15-minute fresh window is a no-op. A transient
+failure (5xx, timeout, network) retries with backoff (10s / 30s / 90s,
+four attempts). Auth failures (401/403) stop at the first attempt. If the
+budget is spent, pi-grok keeps the built-in list and routing stays on the
+proxy. Opening the model picker, `/reload`, `/login`, or `/xai-status`
+starts a fresh sequence after the fresh window or a failure.
+
+Filter or reorder with `PI_XAI_OAUTH_MODELS`. The filter is re-applied after
+live discovery, so it still holds when new catalog ids arrive:
+
+```bash
+export PI_XAI_OAUTH_MODELS="grok-build,grok-4.5"
+```
+
+## How it works
+
+pi requests a device code from xAI and shows you a verification link plus a short code. You open the link in any browser (yours, your phone's, anything), enter the code, and approve. pi polls xAI's token endpoint in the background until you approve, deny, or the code expires. No local server, no port, no browser redirect. This works from SSH, containers, and headless boxes.
+
+Tokens refresh 5 minutes before they expire. You stay logged in until you revoke access. Credentials are stored locally and never leave your machine.
+
+Requests go through xAI's Responses API. Tool calling, streaming, and reasoning all work.
+
+Prefer the browser auto-redirect flow? Set `PI_XAI_LOGIN_METHOD=callback`. pi starts a local HTTP server on `127.0.0.1:56121`, opens your browser to xAI's authorization page, and catches the redirect callback. See [Remote / SSH](#remote--ssh) for the port-forwarding that path needs.
+
+## Check status
+
+```
+/xai-status
+```
+
+Shows your account (email, team, org), Grok Code access, coding-data privacy
+state, and available model count. The account and privacy fields come
+from the cli-chat-proxy `/user` endpoint using your OAuth token; if the lookup
+fails (offline, expired token) the model count still renders.
+
+## Subscription usage
+
+```
+/xai-usage
+```
+
+Shows subscription credit usage. The command resolves your user id from
+`/user`, then looks up `/billing?format=credits` with that id. Only the
+derived numbers render (percentage, used vs. monthly limit, prepaid
+balance, on-demand totals, tier); the raw billing body is never persisted
+or logged. A failed lookup reports the error without partial data.
+
+## Coding data privacy
+
+xAI has an account-level setting controlling whether the code and context you
+send to Grok models is used to train and improve its models. `/xai-privacy`
+toggles that setting. It lives on your xAI account, so it applies across
+every machine and client you log in from.
+
+```
+/xai-privacy
+```
+
+Opens an inline picker with the two options, rendered in the prompt area the
+same way `/login` shows its provider list. The row matching your current mode
+is marked with a green tick, like the configured provider in `/login`.
+Up/down to move, enter to switch, escape or ctrl+c to cancel. The choices are:
+
+| Choice | Effect |
+|---|---|
+| Privacy mode | Your coding data is not used to train or improve xAI's models |
+| Share data | Your coding data may be used to train and improve xAI's models |
+
+You can also pass an alias to skip the picker and set a mode:
+`/xai-privacy opt-out` (aliases `out`, `private`) or `/xai-privacy opt-in`
+(aliases `in`, `share`).
+
+If your organization enforces Zero Data Retention, the choice is locked and
+`/xai-privacy` reports the lock instead of showing the picker.
+
+## Env vars
+
+| Variable | Default |
+|---|---|
+| `PI_XAI_BASE_URL` or `XAI_BASE_URL` | `https://api.x.ai/v1` |
+| `PI_XAI_OAUTH_MODELS` | all models |
+| `PI_XAI_OAUTH_CALLBACK_PORT` | `56121` |
+| `PI_XAI_OAUTH_CALLBACK_HOST` | `127.0.0.1` (bind address for the loopback callback server) |
+| `PI_XAI_OAUTH_CLIENT_ID` | built-in |
+| `PI_XAI_OAUTH_SCOPE` | `openid profile email offline_access grok-cli:access api:access conversations:read conversations:write` |
+| `PI_XAI_LOGIN_METHOD` | `device` (OAuth device flow, works everywhere). Set `callback` (or `browser`) to use the browser + loopback-callback flow instead, which auto-redirects but needs a reachable `127.0.0.1` port and a local browser. |
+| `PI_XAI_CLIENT_VERSION` | `0.2.101` (client version label sent to the proxy) |
+| `PI_XAI_CLIENT_NAME` | `grok-shell` (session product label sent to the proxy) |
+| `XAI_OAUTH_TOKEN` | skip OAuth, use raw token (no refresh, no discovery; proxy routing still applies) |
+| `PI_XAI_X_SEARCH` | `true` |
+| `PI_XAI_X_SEARCH_MODEL` | `grok-4.5` |
+
+## Remote / SSH
+
+The default device-code flow needs no port forwarding. Run `/login` on the remote, open the verification link in your local browser, and enter the code.
+
+If you prefer the browser callback flow (`PI_XAI_LOGIN_METHOD=callback`), forward port 56121:
+
+```bash
+ssh -N -L 56121:127.0.0.1:56121 user@remote-host
+```
+
+Run `/login` in your remote pi session, complete the browser flow locally. If 56121 is taken, the extension picks a random port and prints it.
+
+If the callback port can't be forwarded (e.g. the random fallback above, or the browser is on a machine you can't tunnel to), pi-grok also shows a paste prompt. Complete the login in the browser, then paste the final `http://127.0.0.1:.../callback?code=...` redirect URL back into pi.
+
+## X Search
+
+The `x_search` tool lets any model search X (formerly Twitter). When the model calls `x_search`, pi-grok makes a separate request to xAI's API using your OAuth credentials. The search results come back as a visible tool call in pi's UI.
+
+Enabled by default. Disable with:
+
+```bash
+export PI_XAI_X_SEARCH=false
+```
+
+The model used for the internal search call defaults to `grok-4.5`. Change it with:
+
+```bash
+export PI_XAI_X_SEARCH_MODEL=grok-4.20-0309-reasoning
+```
+
+## Architecture
+
+```
+pi-grok/
+├── index.ts           # provider registration + event hooks
+├── x-search-tool.ts   # x_search tool (separate xAI request)
+├── oauth.ts           # PKCE flow, OIDC discovery + JWKS, token refresh
+├── models.ts          # model definitions + live catalog from xAI
+├── catalog-cache.ts   # on-disk cache for the live catalog body (TTL-bounded)
+├── account.ts         # account + privacy calls (cli-chat-proxy /user, /privacy)
+├── usage.ts           # /xai-usage: subscription credit snapshot from /billing
+├── privacy.ts         # inline themed privacy picker (ctx.ui.custom, green-tick row)
+├── sanitize.ts        # strips unsupported fields before each request
+├── bounded-json.ts    # depth/node-bounded JSON parser for untrusted responses
+├── safe-fetch.ts      # fetch wrapper: rejects HTTP redirects, bounds response bodies
+├── errors.ts          # typed error classes
+├── package.json
+└── tsconfig.json
+```
+
+- **Payload sanitization via `before_provider_request`** - decoupled from streaming, visible to other extensions, chainable.
+- **X Search tool** - proxy via `pi.registerTool`. Any model can search X. Per-query parameters supported.
+- **Live model catalog** - fetches `cli-chat-proxy.grok.com/v1/models` on login for enrichment (context windows, new ids); routing also goes through the CLI chat proxy so requests ride the SuperGrok quota. The merge reads the proxy's `context_window` / `name` / `supports_reasoning_effort` fields (and the OpenAI `context_length` / `max_output_tokens` names if present). The catalog body is cached on disk with a 15-minute fresh TTL and a 7-day stale-if-transient window, so a cold start shows context windows right away instead of waiting on the proxy. A successful fetch re-registers the provider so the picker updates in place. Transient fetch failures retry with backoff (10s / 30s / 90s); `/xai-status` kicks a fresh sequence after the budget is spent.
+- **Account + privacy commands** - `/xai-status` reads the cli-chat-proxy `/user` enrichment for account and retention state; `/xai-privacy` opens an inline themed picker (green-tick current row, matching the login selector) that toggles coding-data-retention via `PUT /privacy/coding-data-retention`.
+- **Subscription usage** - `/xai-usage` resolves the user id from `/user`, then reads `/billing?format=credits`. The response is size-bounded and parsed through a bounded-JSON walker; only the derived numeric fields render.
+- **OIDC signature verification** - `discover()` requires a JWKS URI pinned to the xAI origin and the signing alg ES256. Login and refresh verify id_token signatures against that JWKS via WebCrypto; a kid miss forces one uncached re-fetch so key rotation mid-TTL still works.
+- **Redirect rejection** - every authenticated xAI request goes through a fetch wrapper that sets `redirect: "manual"` and throws on any 3xx, so credentials can't be replayed off the original request URL.
+- **Response body bounding** - every authenticated response is read through a streaming byte cap (`readBoundedText` / `readBoundedJson`) and then a depth/node/array-bounded JSON walker, so a hostile or misbehaving pinned origin can't hang the request or exhaust memory with a pathological body.
+- **Conversation scopes** - the default OAuth scope set includes `conversations:read` and `conversations:write` so the proxy can attach server-side history to `x-grok-conv-id` multi-turn sessions.
+- **Typed errors** - `XaiOAuthError` with machine-readable codes for distinguishing retryable vs fatal failures.
+- **Web Crypto** - `crypto.subtle` for PKCE and ES256 signature verification.
+
+## Credits
+
+- [pi](https://pi.dev)
+- [xAI](https://x.ai)
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+
+## License
+
+MIT

@@ -2,7 +2,7 @@
 # kipsel-bridge 生命周期泛用性验证。
 #
 # 覆盖:单例复用、引用计数、外部 bridge 不被误杀、缺失目录降级、
-#       僵尸持有者自愈、整组终止不留孤儿、缺依赖降级。
+#       僵尸持有者自愈、整组终止不留孤儿、缺依赖降级、独立二进制回退。
 #
 # 全程使用隔离的 STATE_DIR 与端口 9477,不碰真实的 9377 bridge。
 # 沙箱会回收跨调用的后台进程,所以整段必须在一次调用里跑完。
@@ -150,7 +150,7 @@ echo "=== 7. bridge 目录缺失时优雅降级 ==="
 # bridge,而本环境里 fuser 无法反查 socket 持有者(PID namespace 隔离),
 # 杀不干净 —— 所以这里换到独立端口 + 独立状态目录,让前置条件确定成立。
 S7="$STATE/case7"; P7=9478
-out="$(KIPSEL_STATE_DIR="$S7" PIPILOT_PORT="$P7" KIPSEL_BRIDGE_DIR=/nonexistent/bridge "$CTL" ensure 2>&1)"; rc=$?
+out="$(KIPSEL_STATE_DIR="$S7" PIPILOT_PORT="$P7" KIPSEL_BRIDGE_DIR=/nonexistent/bridge KIPSEL_BRIDGE_NO_DOWNLOAD=1 "$CTL" ensure 2>&1)"; rc=$?
 check "退出码仍为 0" "$rc" "0"
 [[ "$out" == *"跳过 bridge"* ]] && ok "给出跳过原因" || bad "缺少跳过提示: [$out]"
 
@@ -165,11 +165,55 @@ echo
 echo "=== 9. 未安装依赖时拒绝启动 ==="
 S9="$STATE/case9"; P9=9479
 FAKE="$S9/fake-bridge"; mkdir -p "$FAKE"
-out="$(KIPSEL_STATE_DIR="$S9" PIPILOT_PORT="$P9" KIPSEL_BRIDGE_DIR="$FAKE" "$CTL" ensure 2>&1)"
+out="$(KIPSEL_STATE_DIR="$S9" PIPILOT_PORT="$P9" KIPSEL_BRIDGE_DIR="$FAKE" KIPSEL_BRIDGE_NO_DOWNLOAD=1 "$CTL" ensure 2>&1)"
 [[ "$out" == *"未安装依赖"* ]] && ok "检测到缺依赖并跳过" || bad "缺依赖处理异常: [$out]"
 
 echo
-echo "=== 10. 收尾:套件不留下自己启的 bridge ==="
+echo "=== 10. 源码目录缺失时回退到独立二进制 ==="
+# 用一个 mock “二进制”代替代理真 bridge(只实现 /health),验证回退路径、
+# 归属登记与整组回收对二进制同样成立。KIPSEL_BRIDGE_BIN 指向 mock 即跳过下载。
+S10="$STATE/case10"; P10=9480; MOCK="$S10/mock-bridge"
+mkdir -p "$S10"
+cat > "$MOCK" <<'PYEOF'
+#!/usr/bin/env python3
+import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            body = json.dumps({"ok": True}, separators=(",", ":")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", int(os.environ.get("PIPILOT_PORT", "9377"))), H).serve_forever()
+PYEOF
+chmod +x "$MOCK"
+out="$(KIPSEL_STATE_DIR="$S10" PIPILOT_PORT="$P10" KIPSEL_BRIDGE_DIR=/nonexistent/bridge KIPSEL_BRIDGE_BIN="$MOCK" "$CTL" ensure 2>&1)"; rc=$?
+check "退出码仍为 0" "$rc" "0"
+health10() { curl -s --max-time 2 "http://127.0.0.1:$P10/health" 2>/dev/null | grep -q '"ok":true'; }
+wait_until "mock 二进制 bridge 就绪" 15 health10
+health10 && ok "二进制回退拉起 bridge" || bad "二进制回退未拉起 bridge"
+[[ -n "$(sed -n 's/^pgid=//p' "$S10/bridge.owner" 2>/dev/null | head -1)" ]] && ok "二进制路径也登记了归属" || bad "二进制路径缺归属记录"
+# 二进制路径会兜底生成 PIPILOT_TOKEN(持久化、0600)
+[[ -s "$S10/bridge-token" && "$(stat -c %a "$S10/bridge-token" 2>/dev/null || stat -f %Lp "$S10/bridge-token")" == "600" ]] \
+	&& ok "PIPILOT_TOKEN 已持久化(0600)" || bad "PIPILOT_TOKEN 兜底异常"
+BPID="$(sed -n 's/^pgid=//p' "$S10/bridge.owner" | head -1)"
+KIPSEL_STATE_DIR="$S10" "$CTL" release >/dev/null 2>&1
+sleep 2
+curl -s --max-time 2 "http://127.0.0.1:$P10/health" >/dev/null 2>&1 && bad "二进制 bridge 未被回收" || ok "二进制 bridge 已整组回收"
+[[ -z "$BPID" || ! -d "/proc/$BPID" ]] && ok "组长进程已退出" || bad "组长进程残留"
+
+echo
+echo "=== 11. 收尾:套件不留下自己启的 bridge ==="
 # 用例 6 强杀会话后 bridge 仍在跑(这正是要验证的自愈行为),用例 7/9 用的是
 # 独立状态目录,所以主 STATE 的 bridge 会留到最后。必须显式收掉,否则同一
 # shell 里再跑一次时,残留进程会污染计数与健康检查。

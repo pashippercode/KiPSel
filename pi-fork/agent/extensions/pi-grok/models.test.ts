@@ -1,0 +1,917 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	COST_45,
+	FALLBACK_MODELS,
+	CLI_PROXY_BASE_URL as CLI_PROXY_URL,
+	buildProxyHeaders,
+	applyDiscoveredModels,
+	filterModelsByEnv,
+	mergeDiscoveredModels,
+	mergeLiveModels,
+	rebuildModelsForOAuth,
+	resetDiscoveryForTests,
+	discoveryStatus,
+	supportsReasoningEffort,
+	thinkingLevelMapFor,
+	triggerDiscovery,
+	onCatalogUpdated,
+	_setCatalogCachePathForTests,
+	_setDiscoveryRetryDelaysForTests,
+} from "./models.js";
+
+describe("FALLBACK_MODELS", () => {
+	it("includes grok-4.5", () => {
+		const m = FALLBACK_MODELS.find((x) => x.id === "grok-4.5");
+		expect(m).toBeDefined();
+		expect(m?.name).toBe("Grok 4.5");
+		expect(m?.reasoning).toBe(true);
+		expect(m?.input).toEqual(["text", "image"]);
+		expect(m?.contextWindow).toBe(500_000);
+	});
+
+	it("includes grok-4.6", () => {
+		const m = FALLBACK_MODELS.find((x) => x.id === "grok-4.6");
+		expect(m).toBeDefined();
+		expect(m?.name).toBe("Grok 4.6");
+		expect(m?.reasoning).toBe(true);
+		expect(m?.input).toEqual(["text", "image"]);
+		// cli-chat-proxy /models reports context_window 500000; grok-4.6 is
+		// priced the same as grok-4.5.
+		expect(m?.contextWindow).toBe(500_000);
+		expect(m?.cost).toEqual(COST_45);
+	});
+
+	it("grok-build matches the official context window (500k)", () => {
+		const m = FALLBACK_MODELS.find((x) => x.id === "grok-build");
+		expect(m).toBeDefined();
+		// grok-build's default_models.json ships context_window 500000; a larger
+		// value skews pi's usage bar and auto-compaction.
+		expect(m?.contextWindow).toBe(500_000);
+	});
+
+	it("grok-4.5 carries the observed max output tokens (128k)", () => {
+		const m = FALLBACK_MODELS.find((x) => x.id === "grok-4.5");
+		expect(m?.maxTokens).toBe(131_072);
+	});
+
+	it("carries no routing hints (routing is owned by rebuildModelsForOAuth)", () => {
+		// FALLBACK is model metadata only. baseUrl/headers are stamped at rebuild
+		// time so every OAuth model rides the CLI proxy uniformly.
+		for (const m of FALLBACK_MODELS) {
+			expect(m.baseUrl).toBeUndefined();
+			expect(m.headers).toBeUndefined();
+		}
+	});
+});
+
+describe("buildProxyHeaders", () => {
+	it("carries the client identity, version, mode, and auth headers the proxy expects", () => {
+		const h = buildProxyHeaders();
+		// User-Agent and client identifier identify the client product; the
+		// version gate, mode label, and the two auth-middleware headers mark
+		// an OAuth CLI session. No surface header.
+		expect(h["x-grok-client-identifier"]).toBe("grok-shell");
+		expect(h["User-Agent"]).toMatch(/^grok-shell\/0\.2\.101 \((macos|windows|linux); (aarch64|x86_64)\)$/);
+		expect(h["x-grok-client-version"]).toBe("0.2.101");
+		expect(h["x-grok-client-mode"]).toBe("interactive");
+		expect(h["X-XAI-Token-Auth"]).toBe("xai-grok-cli");
+		expect(h["x-authenticateresponse"]).toBe("authenticate-response");
+		expect(h["x-grok-client-surface"]).toBeUndefined();
+	});
+
+	it("omits x-grok-model-override for non-inference calls", () => {
+		expect(buildProxyHeaders()["x-grok-model-override"]).toBeUndefined();
+	});
+
+	it("adds x-grok-model-override for an inference model", () => {
+		expect(buildProxyHeaders("grok-4.5")["x-grok-model-override"]).toBe("grok-4.5");
+	});
+
+	it("returns a fresh object per call (no shared reference)", () => {
+		expect(buildProxyHeaders()).not.toBe(buildProxyHeaders());
+	});
+});
+
+describe("COST_45", () => {
+	it("matches xAI public API pricing ($/M tokens)", () => {
+		expect(COST_45.input).toBe(2);
+		expect(COST_45.output).toBe(6);
+		// Cached input is $0.50/M, not the $0.20 used by older models.
+		expect(COST_45.cacheRead).toBe(0.5);
+		expect(COST_45.cacheWrite).toBe(0);
+	});
+});
+
+describe("FALLBACK_MODELS pricing", () => {
+	it("grok-build matches the public pricing page (base tier)", () => {
+		const m = FALLBACK_MODELS.find((x) => x.id === "grok-build");
+		expect(m?.cost).toEqual({ input: 1, output: 2, cacheRead: 0.2, cacheWrite: 0 });
+	});
+
+	it("grok-4.20 models match the public pricing page (base tier)", () => {
+		for (const id of ["grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-4.20-multi-agent-0309"]) {
+			const m = FALLBACK_MODELS.find((x) => x.id === id);
+			expect(m?.cost).toEqual({ input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 });
+		}
+	});
+});
+
+describe("supportsReasoningEffort", () => {
+	it("returns true for grok-4.5", () => {
+		expect(supportsReasoningEffort("grok-4.5")).toBe(true);
+	});
+
+	it("returns true for grok-4.6", () => {
+		expect(supportsReasoningEffort("grok-4.6")).toBe(true);
+	});
+
+	it("returns true for grok-4.5 with provider prefix", () => {
+		expect(supportsReasoningEffort("xai-oauth/grok-4.5")).toBe(true);
+	});
+
+	it("returns false for a model outside the allowlist", () => {
+		expect(supportsReasoningEffort("grok-4.20-0309-non-reasoning")).toBe(false);
+	});
+});
+
+describe("thinkingLevelMapFor", () => {
+	it("exposes low/medium/high/xhigh for an effort-capable reasoning model", () => {
+		expect(thinkingLevelMapFor("grok-4.5", true)).toEqual({ off: null, minimal: null, xhigh: "xhigh" });
+	});
+
+	it("exposes low/medium/high/xhigh for grok-4.6", () => {
+		expect(thinkingLevelMapFor("grok-4.6", true)).toEqual({ off: null, minimal: null, xhigh: "xhigh" });
+	});
+
+	it("honors a provider-qualified id", () => {
+		expect(thinkingLevelMapFor("xai-oauth/grok-4.3", true)).toEqual({ off: null, minimal: null, xhigh: "xhigh" });
+	});
+
+	it("returns undefined for a non-effort reasoning model", () => {
+		// grok-build is not effort-capable, so it gets no picker regardless of
+		// the reasoning flag; nothing to map.
+		expect(thinkingLevelMapFor("grok-build", true)).toBeUndefined();
+	});
+
+	it("returns undefined for a non-reasoning model", () => {
+		expect(thinkingLevelMapFor("grok-4.20-0309-non-reasoning", false)).toBeUndefined();
+	});
+});
+
+describe("filterModelsByEnv", () => {
+	it("returns the list unchanged when env ids are empty", () => {
+		expect(filterModelsByEnv(FALLBACK_MODELS, [])).toEqual(FALLBACK_MODELS);
+	});
+
+	it("filters and reorders by the env id list", () => {
+		const filtered = filterModelsByEnv(FALLBACK_MODELS, ["grok-4.5", "grok-build"]);
+		expect(filtered.map((m) => m.id)).toEqual(["grok-4.5", "grok-build"]);
+	});
+
+	it("synthesizes a default entry for unknown env ids", () => {
+		const filtered = filterModelsByEnv(FALLBACK_MODELS, ["grok-custom"]);
+		expect(filtered).toHaveLength(1);
+		expect(filtered[0].id).toBe("grok-custom");
+		expect(filtered[0].baseUrl).toBeUndefined();
+	});
+
+	it("returns copies, not the fallback object references, so callers cannot mutate the source", () => {
+		// Empty env: deep-equal but distinct objects.
+		const empty = filterModelsByEnv(FALLBACK_MODELS, []);
+		expect(empty).toEqual(FALLBACK_MODELS);
+		expect(empty[0]).not.toBe(FALLBACK_MODELS[0]);
+
+		// Non-empty: known-id entries are copies too.
+		const filtered = filterModelsByEnv(FALLBACK_MODELS, ["grok-4.5"]);
+		const source = FALLBACK_MODELS.find((m) => m.id === "grok-4.5")!;
+		expect(filtered[0]).not.toBe(source);
+		filtered[0].contextWindow = 1;
+		expect(source.contextWindow).not.toBe(1);
+	});
+});
+
+describe("mergeLiveModels", () => {
+	const base = FALLBACK_MODELS;
+
+	it("returns the base list when the live response is null", () => {
+		expect(mergeLiveModels(base, null)).toEqual(base);
+	});
+
+	it("returns the base list when the live response has no data array", () => {
+		expect(mergeLiveModels(base, { data: undefined } as any)).toEqual(base);
+	});
+
+	it("reads the cli-chat-proxy field names (context_window, name, effort)", () => {
+		// The proxy sends context_window and name. It does not send
+		// context_length or max_output_tokens. A merge that only reads the
+		// OpenAI names drops the live window and the display name.
+		const merged = mergeLiveModels(base, {
+			data: [{
+				id: "grok-9",
+				name: "Grok Nine",
+				context_window: 777_000,
+				supports_reasoning_effort: true,
+			}],
+		});
+		const m = merged.find((x) => x.id === "grok-9");
+		expect(m).toBeDefined();
+		expect(m?.name).toBe("Grok Nine");
+		expect(m?.contextWindow).toBe(777_000);
+		expect(m?.reasoning).toBe(true);
+		expect(m?.thinkingLevelMap).toEqual({ off: null, minimal: null, xhigh: "xhigh" });
+
+		const known = mergeLiveModels(base, {
+			data: [{ id: "grok-4.5", context_window: 424_000, name: "Grok 4.5" }],
+		}).find((x) => x.id === "grok-4.5");
+		expect(known?.contextWindow).toBe(424_000);
+	});
+
+	it("appends a newly discovered model id with sensible defaults", () => {
+		const merged = mergeLiveModels(base, {
+			data: [{ id: "grok-9", context_length: 2_000_000, max_output_tokens: 64_000 }],
+		});
+		const m = merged.find((x) => x.id === "grok-9");
+		expect(m).toBeDefined();
+		expect(m?.contextWindow).toBe(2_000_000);
+		expect(m?.maxTokens).toBe(64_000);
+		expect(m?.input).toEqual(["text", "image"]);
+		expect(m?.reasoning).toBe(true);
+	});
+
+	it("lets live catalog fields override base metadata for a known id", () => {
+		// Live is authoritative for fields the API returns.
+		const merged = mergeLiveModels(base, {
+			data: [
+				{ id: "grok-4.5", context_length: 999, max_output_tokens: 999 },
+			],
+		});
+		const m = merged.find((x) => x.id === "grok-4.5")!;
+		expect(m.contextWindow).toBe(999);
+		expect(m.maxTokens).toBe(999);
+		// Base still supplies fields the API does not expose.
+		expect(m.name).toBe("Grok 4.5");
+		expect(m.cost).toEqual(COST_45);
+	});
+
+	it("does not set routing: merge is enrichment only", () => {
+		// Routing is owned by rebuildModelsForOAuth. A discovered id carries no
+		// baseUrl/headers here, regardless of which endpoint reported it.
+		const merged = mergeLiveModels(base, {
+			data: [{ id: "grok-4.5", context_length: 500_000 }],
+		});
+		const m = merged.find((x) => x.id === "grok-4.5")!;
+		expect(m.baseUrl).toBeUndefined();
+		expect(m.headers).toBeUndefined();
+
+		const fresh = merged.find((x) => x.id === "grok-9-future" || undefined);
+		if (fresh) {
+			expect(fresh.baseUrl).toBeUndefined();
+			expect(fresh.headers).toBeUndefined();
+		}
+	});
+
+	it("filters out non-chat entries (embeddings, tts, grok-imagine)", () => {
+		const merged = mergeLiveModels(base, {
+			data: [
+				{ id: "grok-4.5" },
+				{ id: "embedding-001" },
+				{ id: "tts-1" },
+				{ id: "grok-imagine-image" },
+				{ id: "grok-imagine-video-1.5" },
+			],
+		});
+		const ids = merged.map((x) => x.id);
+		expect(ids).not.toContain("embedding-001");
+		expect(ids).not.toContain("tts-1");
+		expect(ids).not.toContain("grok-imagine-image");
+		expect(ids).not.toContain("grok-imagine-video-1.5");
+	});
+
+	it("keeps base models that are absent from the live response", () => {
+		const merged = mergeLiveModels(base, { data: [{ id: "grok-4.5" }] });
+		for (const fb of base) {
+			expect(merged.some((x) => x.id === fb.id)).toBe(true);
+		}
+	});
+});
+
+describe("applyDiscoveredModels + env filter", () => {
+	beforeEach(() => {
+		resetDiscoveryForTests();
+		_setCatalogCachePathForTests("");
+	});
+
+	afterEach(() => {
+		resetDiscoveryForTests();
+	});
+
+	it("re-applies the env filter after discovery so new ids stay out", () => {
+		const body = {
+			data: [
+				{ id: "grok-4.5", context_length: 500_000 },
+				{ id: "grok-9-future", context_length: 2_000_000 },
+			],
+		};
+		const base = FALLBACK_MODELS.filter((m) => m.id === "grok-build");
+		const merged = mergeLiveModels(base, body);
+		const filtered = filterModelsByEnv(merged, ["grok-build"]);
+		expect(filtered.map((m) => m.id)).toEqual(["grok-build"]);
+		expect(filtered.some((m) => m.id === "grok-9-future")).toBe(false);
+	});
+
+	it("returns the base list when the discovery cache is empty", () => {
+		const base = FALLBACK_MODELS.filter((m) => m.id === "grok-4.5");
+		expect(applyDiscoveredModels(base, [])).toEqual(base);
+	});
+});
+
+describe("rebuildModelsForOAuth", () => {
+	beforeEach(() => {
+		resetDiscoveryForTests();
+		_setCatalogCachePathForTests("");
+	});
+
+	afterEach(() => {
+		resetDiscoveryForTests();
+	});
+
+	const foreign = {
+		id: "claude-sonnet",
+		name: "Claude Sonnet",
+		provider: "anthropic",
+		api: "anthropic-messages",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 3, output: 15, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 8_000,
+	};
+
+	const ours = FALLBACK_MODELS.map((m) => ({
+		...m,
+		provider: "xai-oauth",
+		api: "openai-responses",
+	}));
+
+	it("routes every OAuth model through the CLI proxy with the proxy headers", () => {
+		// Subscription inference always rides the proxy. Every provider model
+		// gets the proxy baseUrl + header set, regardless of what FALLBACK or
+		// discovery carried.
+		const result = rebuildModelsForOAuth(
+			[...ours] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		for (const m of result as Array<Record<string, unknown>>) {
+			expect(m.baseUrl).toBe(CLI_PROXY_URL);
+			expect(m.headers).toEqual(buildProxyHeaders(m.id as string));
+		}
+	});
+
+	it("routes grok-4.5 through the proxy on the first load (no discovery needed)", () => {
+		// This is the regression guard for the timing bug: before this fix,
+		// grok-4.5 stayed on api.x.ai until background discovery completed.
+		const bare = FALLBACK_MODELS
+			.filter((m) => m.id === "grok-4.5")
+			.map((m) => ({ ...m, provider: "xai-oauth", api: "openai-responses" }));
+		const result = rebuildModelsForOAuth(
+			bare as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		expect(result[0].baseUrl).toBe(CLI_PROXY_URL);
+		expect(result[0].headers).toEqual(buildProxyHeaders("grok-4.5"));
+	});
+
+	it("stamps api/provider on entries that lack them", () => {
+		const result = rebuildModelsForOAuth(
+			[...ours] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		for (const m of result as Array<Record<string, unknown>>) {
+			expect(m.api).toBe("openai-responses");
+			expect(m.provider).toBe("xai-oauth");
+		}
+	});
+
+	it("hides off/minimal and enables xhigh on effort-capable OAuth models", () => {
+		// grok-4.5 rejects reasoning.effort "none" (the host's off value) and
+		// exposes low/medium/high/xhigh. rebuild stamps the map so the host
+		// picker offers that set and nothing the model rejects.
+		const result = rebuildModelsForOAuth(
+			[...ours] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		const grok45 = result.find((m) => (m as any).id === "grok-4.5") as any;
+		expect(grok45.thinkingLevelMap).toEqual({ off: null, minimal: null, xhigh: "xhigh" });
+	});
+
+	it("stamps the off map on a discovered effort-capable model", () => {
+		// A live-catalog id absent from FALLBACK still needs the map so off
+		// is hidden once discovery adds it.
+		const discovered = {
+			...FALLBACK_MODELS[0],
+			id: "grok-4.5-preview",
+			name: "Grok 4.5 Preview",
+			reasoning: true,
+			provider: "xai-oauth",
+			api: "openai-responses",
+		};
+		const result = rebuildModelsForOAuth(
+			[discovered] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		const found = result.find((m) => (m as any).id === "grok-4.5-preview") as any;
+		expect(found.thinkingLevelMap).toEqual({ off: null, minimal: null, xhigh: "xhigh" });
+	});
+
+	it("does not stamp a thinkingLevelMap on the non-reasoning model", () => {
+		const result = rebuildModelsForOAuth(
+			[...ours] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		const nonReasoning = result.find(
+			(m) => (m as any).id === "grok-4.20-0309-non-reasoning",
+		) as any;
+		// The non-reasoning model is reasoning: false; getSupportedThinkingLevels
+		// short-circuits to off-only without consulting a map, so none is stamped.
+		expect(nonReasoning.thinkingLevelMap).toBeUndefined();
+		expect(nonReasoning.reasoning).toBe(false);
+	});
+
+	it("preserves non-provider models untouched", () => {
+		const result = rebuildModelsForOAuth(
+			[foreign, ...ours] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+		const claude = result.find((m) => (m as any).id === "claude-sonnet") as any;
+		expect(claude).toBeDefined();
+		expect(claude.provider).toBe("anthropic");
+		expect(claude.baseUrl).toBe("https://api.anthropic.com");
+	});
+
+	it("re-applies env filter so discovery cannot bypass PI_XAI_OAUTH_MODELS", () => {
+		const result = rebuildModelsForOAuth(
+			ours as Array<Record<string, unknown>>,
+			"xai-oauth",
+			["grok-build", "grok-4.5"],
+		);
+		expect(result.map((m) => (m as any).id)).toEqual(["grok-build", "grok-4.5"]);
+	});
+});
+
+describe("discovery cache", () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeAll(() => {
+		globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+			const u = String(url);
+			if (!u.endsWith("/models")) {
+				return new Response("not found", { status: 404 });
+			}
+			// Discovery hits the cli-chat-proxy /v1/models catalog for enrichment
+			// (context windows, new ids). Include a non-chat entry to prove the
+			// status count filters it out.
+			return new Response(
+				JSON.stringify({
+					data: [
+						{ id: "grok-4.5", context_length: 500_000, max_output_tokens: 30_000 },
+						{ id: "grok-9-future", context_length: 2_000_000, max_output_tokens: 64_000 },
+						{ id: "grok-embedding-v1", context_length: 8_000 },
+					],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+	});
+
+	afterAll(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	beforeEach(() => {
+		resetDiscoveryForTests();
+		_setCatalogCachePathForTests("");
+	});
+
+	afterEach(() => {
+		resetDiscoveryForTests();
+		vi.clearAllMocks();
+	});
+
+	it("returns the base list unchanged before any fetch completes", () => {
+		const before = mergeDiscoveredModels(FALLBACK_MODELS);
+		expect(before).toEqual(FALLBACK_MODELS);
+	});
+
+	it("reports cold state before any fetch and warm after", async () => {
+		expect(discoveryStatus().state).toBe("cold");
+		expect(discoveryStatus().lastError).toBeNull();
+		triggerDiscovery("token", CLI_PROXY_URL);
+		// While the fire-and-forget fetch runs the state is in-flight, then warm.
+		const deadline = Date.now() + 2000;
+		while (discoveryStatus().state !== "warm" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		const status = discoveryStatus();
+		expect(status.state).toBe("warm");
+		// Two chat models; the embedding entry is filtered out of the count.
+		expect(status.modelCount).toBe(2);
+		expect(status.lastError).toBeNull();
+		expect(status.fetchedAt).toBeGreaterThan(0);
+	});
+
+	it("does not drop a re-trigger when the token has changed", () => {
+		triggerDiscovery("token-a", CLI_PROXY_URL);
+		triggerDiscovery("token-a", CLI_PROXY_URL); // same token: dropped
+		triggerDiscovery("token-b", CLI_PROXY_URL); // new token: not dropped
+		// token-b forces a fresh fetch; discoveryLastToken tracks the latest.
+		// (Behavioral assertion: the call returns without throwing and accepts
+		// the new token rather than no-oping on the in-flight guard.)
+		expect(discoveryStatus().state).not.toBe("cold");
+	});
+
+	it("a superseded fetch does not overwrite the cache or strand the in-flight flag", async () => {
+		// Make token A's fetch resolve slowly, then supersede with B before A lands.
+		const sharedFetch = globalThis.fetch;
+		let resolveA!: (v: Response) => void;
+		const slowA = new Promise<Response>((r) => { resolveA = r; });
+		let aCalls = 0;
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			const url = String(input);
+			if (!url.endsWith("/models")) return new Response("404", { status: 404 });
+			// token-a is triggered first, so the first /models call is the slow one.
+			if (aCalls++ === 0) return slowA;
+			return new Response(JSON.stringify({ data: [
+				{ id: "grok-4.5", context_length: 500_000 },
+			] }), { status: 200, headers: { "Content-Type": "application/json" } });
+		}) as typeof fetch;
+
+		try {
+			triggerDiscovery("token-a", CLI_PROXY_URL);
+			triggerDiscovery("token-b", CLI_PROXY_URL); // supersedes A while A is pending
+
+			// Wait for B (the fast one) to settle and clear the in-flight flag.
+			const deadline = Date.now() + 2000;
+			while (discoveryStatus().state === "in-flight" && Date.now() < deadline) {
+				await new Promise((r) => setTimeout(r, 20));
+			}
+			expect(discoveryStatus().state).toBe("warm");
+			expect(discoveryStatus().modelCount).toBe(1); // B's single-model catalog
+
+			// Now let A's stale fetch complete. It must not overwrite B's cache.
+			resolveA(new Response(JSON.stringify({ data: [
+				{ id: "grok-stale", context_length: 999_999 },
+			] }), { status: 200, headers: { "Content-Type": "application/json" } }));
+			await new Promise((r) => setTimeout(r, 50));
+
+			const status = discoveryStatus();
+			expect(status.modelCount).toBe(1); // still B's, not A's stale entry
+			expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-stale")).toBe(false);
+			expect(status.state).not.toBe("in-flight"); // A did not strand the flag
+		} finally {
+			globalThis.fetch = sharedFetch;
+		}
+	});
+
+	it("surfaces discovered models after a successful fetch (enrichment only)", async () => {
+		triggerDiscovery("token", "https://api.x.ai/v1");
+		let merged = mergeDiscoveredModels(FALLBACK_MODELS);
+		const deadline = Date.now() + 2000;
+		while (!merged.some((m) => m.id === "grok-9-future") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 20));
+			merged = mergeDiscoveredModels(FALLBACK_MODELS);
+		}
+		const future = merged.find((m) => m.id === "grok-9-future");
+		expect(future).toBeDefined();
+		expect(future?.contextWindow).toBe(2_000_000);
+		// Enrichment sets no routing; rebuild owns baseUrl/headers.
+		expect(future?.baseUrl).toBeUndefined();
+		expect(future?.headers).toBeUndefined();
+	});
+
+	it("rebuild routes discovered ids through the proxy once the cache is warm", async () => {
+		triggerDiscovery("token", "https://api.x.ai/v1");
+		const deadline = Date.now() + 2000;
+		while (!mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-9-future") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+
+		const ours = FALLBACK_MODELS.map((m) => ({
+			...m,
+			provider: "xai-oauth",
+			api: "openai-responses",
+		}));
+		const foreign = {
+			id: "other",
+			provider: "other",
+			api: "openai-completions",
+			baseUrl: "https://example.com",
+		};
+		const result = rebuildModelsForOAuth(
+			[foreign, ...ours] as Array<Record<string, unknown>>,
+			"xai-oauth",
+		);
+
+		// A newly discovered id still rides the proxy, like every OAuth model.
+		const future = result.find((m) => (m as any).id === "grok-9-future") as any;
+		expect(future).toBeDefined();
+		expect(future.provider).toBe("xai-oauth");
+		expect(future.api).toBe("openai-responses");
+		expect(future.baseUrl).toBe(CLI_PROXY_URL);
+		expect(future.headers).toEqual(buildProxyHeaders("grok-9-future"));
+
+		// grok-4.5 through the proxy too.
+		const g45 = result.find((m) => (m as any).id === "grok-4.5") as any;
+		expect(g45.baseUrl).toBe(CLI_PROXY_URL);
+
+		// Non-provider model passes through untouched.
+		const other = result.find((m) => (m as any).provider === "other") as any;
+		expect(other.baseUrl).toBe("https://example.com");
+	});
+
+	it("skips a second fetch while the in-memory catalog is still fresh", async () => {
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 2000;
+		while (discoveryStatus().state !== "warm" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(discoveryStatus().state).toBe("warm");
+		const fetchMock = globalThis.fetch as unknown as { mock: { calls: unknown[] } };
+		const before = fetchMock.mock.calls.length;
+		triggerDiscovery("token", CLI_PROXY_URL);
+		await new Promise((r) => setTimeout(r, 30));
+		expect(fetchMock.mock.calls.length).toBe(before);
+	});
+
+	it("notifies onCatalogUpdated after a successful fetch", async () => {
+		let hits = 0;
+		onCatalogUpdated(() => { hits++; });
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 2000;
+		while (hits === 0 && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(hits).toBe(1);
+		expect(discoveryStatus().state).toBe("warm");
+	});
+
+	it("routes the OAuth catalog fetch through the cli-chat-proxy, not api.x.ai", async () => {
+		triggerDiscovery("token", CLI_PROXY_URL);
+		// Let the fire-and-forget fetch resolve.
+		const deadline = Date.now() + 2000;
+		while (!mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-9-future") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		const calls = (globalThis.fetch as unknown as { mock: { calls: [string, unknown][] } }).mock.calls;
+		const modelsCall = calls.find(([url]) => String(url).endsWith("/models"));
+		expect(modelsCall).toBeDefined();
+		expect(String(modelsCall![0])).toBe(`${CLI_PROXY_URL}/models`);
+		const init = modelsCall![1] as Record<string, unknown>;
+		expect(init.headers).toMatchObject({
+			Authorization: "Bearer token",
+			"X-XAI-Token-Auth": "xai-grok-cli",
+		});
+	});
+
+	it("retries a transient failure and warms the cache on a later success", async () => {
+		_setDiscoveryRetryDelaysForTests([5, 5]);
+		let calls = 0;
+		globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+			if (!String(url).endsWith("/models")) return new Response("404", { status: 404 });
+			calls++;
+			if (calls < 3) return new Response("upstream", { status: 503 });
+			return new Response(JSON.stringify({
+				data: [{ id: "grok-after-retry", context_length: 500_000 }],
+			}), { status: 200, headers: { "Content-Type": "application/json" } });
+		}) as typeof fetch;
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 2000;
+		while (discoveryStatus().state !== "warm" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(discoveryStatus().state).toBe("warm");
+		expect(discoveryStatus().lastError).toBeNull();
+		expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-after-retry")).toBe(true);
+		expect(calls).toBe(3);
+	});
+
+	it("records the HTTP status and stops retrying on 401", async () => {
+		_setDiscoveryRetryDelaysForTests([5, 5]);
+		let calls = 0;
+		globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+			if (!String(url).endsWith("/models")) return new Response("404", { status: 404 });
+			calls++;
+			return new Response("expired", { status: 401 });
+		}) as typeof fetch;
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 1000;
+		while (discoveryStatus().state === "in-flight" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(discoveryStatus().state).toBe("cold");
+		expect(discoveryStatus().lastError).toBe("catalog fetch failed (401)");
+		await new Promise((r) => setTimeout(r, 40));
+		expect(calls).toBe(1);
+	});
+
+	it("retries an empty catalog instead of adopting it as warm", async () => {
+		_setDiscoveryRetryDelaysForTests([5]);
+		let calls = 0;
+		globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+			if (!String(url).endsWith("/models")) return new Response("404", { status: 404 });
+			calls++;
+			if (calls === 1) {
+				return new Response(JSON.stringify({ data: [] }), {
+					status: 200, headers: { "Content-Type": "application/json" },
+				});
+			}
+			return new Response(JSON.stringify({
+				data: [{ id: "grok-after-empty", context_length: 500_000 }],
+			}), { status: 200, headers: { "Content-Type": "application/json" } });
+		}) as typeof fetch;
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 2000;
+		while (discoveryStatus().state !== "warm" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(discoveryStatus().state).toBe("warm");
+		expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-after-empty")).toBe(true);
+		expect(calls).toBe(2);
+	});
+
+	it("exhausts the retry budget and keeps the last error", async () => {
+		_setDiscoveryRetryDelaysForTests([5, 5]);
+		let calls = 0;
+		globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+			if (!String(url).endsWith("/models")) return new Response("404", { status: 404 });
+			calls++;
+			return new Response("upstream", { status: 503 });
+		}) as typeof fetch;
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 2000;
+		while (discoveryStatus().state === "in-flight" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(discoveryStatus().state).toBe("cold");
+		expect(discoveryStatus().lastError).toBe("catalog fetch failed (503)");
+		expect(calls).toBe(3);
+	});
+
+	it("cancels a pending retry when a newer token supersedes", async () => {
+		_setDiscoveryRetryDelaysForTests([200]);
+		let calls = 0;
+		globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+			if (!String(url).endsWith("/models")) return new Response("404", { status: 404 });
+			calls++;
+			const headers = init?.headers as Record<string, string> | undefined;
+			if (headers?.Authorization === "Bearer token-a") return new Response("upstream", { status: 503 });
+			return new Response(JSON.stringify({
+				data: [{ id: "grok-from-b", context_length: 500_000 }],
+			}), { status: 200, headers: { "Content-Type": "application/json" } });
+		}) as typeof fetch;
+
+		triggerDiscovery("token-a", CLI_PROXY_URL);
+		const mid = Date.now() + 500;
+		while (discoveryStatus().lastError === null && Date.now() < mid) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		// token-a failed once and is waiting on the 200ms retry delay.
+		expect(discoveryStatus().lastError).toMatch(/503/);
+		triggerDiscovery("token-b", CLI_PROXY_URL);
+
+		const deadline = Date.now() + 2000;
+		while (discoveryStatus().state !== "warm" && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(discoveryStatus().state).toBe("warm");
+		expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-from-b")).toBe(true);
+		// token-a's scheduled retry must not fire after B superseded it.
+		await new Promise((r) => setTimeout(r, 250));
+		expect(calls).toBe(2);
+	});
+});
+
+describe("on-disk catalog cache", () => {
+	const originalFetch = globalThis.fetch;
+	let tmpDir: string;
+	let cachePath: string;
+
+	beforeAll(async () => {
+		tmpDir = await mkdtemp(join(tmpdir(), "pi-grok-cache-"));
+		cachePath = join(tmpDir, "cache", "pi-grok", "models.json");
+	});
+	afterAll(async () => {
+		await rm(tmpDir, { recursive: true, force: true });
+	});
+
+	beforeEach(() => {
+		resetDiscoveryForTests();
+		_setCatalogCachePathForTests(cachePath);
+		globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+			const u = String(url);
+			if (!u.endsWith("/models")) return new Response("not found", { status: 404 });
+			return new Response(JSON.stringify({ data: [
+				{ id: "grok-live", context_length: 800_000, max_output_tokens: 32_000 },
+			] }), { status: 200, headers: { "Content-Type": "application/json" } });
+		}) as typeof fetch;
+	});
+	afterEach(() => {
+		resetDiscoveryForTests();
+		globalThis.fetch = originalFetch;
+	});
+
+	it("adopts a fresh on-disk cache as the in-memory state before fetching", async () => {
+		// Seed the cache with a fresh body for a model the network mock does not
+		// return. With the network fetch held pending, the only way the id lands
+		// in the in-memory catalog is via the disk seed.
+		await mkdir(join(tmpDir, "cache", "pi-grok"), { recursive: true });
+		const seeded = {
+			schemaVersion: 1,
+			fetchedAt: Date.now(),
+			body: { data: [{ id: "grok-seeded-from-disk", context_length: 100_000 }] },
+		};
+		await writeFile(cachePath, JSON.stringify(seeded), "utf8");
+
+		// Hold the network response so it cannot race the disk load.
+		let _resolveLive: (r: Response) => void = () => {};
+		const held = new Promise<Response>((r) => { _resolveLive = r; });
+		globalThis.fetch = vi.fn(async () => held) as typeof fetch;
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 1000;
+		while (!mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-seeded-from-disk") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-seeded-from-disk")).toBe(true);
+
+		// Release the fetch so the worker resolves cleanly and the in-flight
+		// flag clears for the next test.
+		_resolveLive(new Response(JSON.stringify({ data: [{ id: "grok-live" }] }), {
+			status: 200, headers: { "Content-Type": "application/json" },
+		}));
+	});
+
+	it("writes a successful fetch to the cache file", async () => {
+		triggerDiscovery("token", CLI_PROXY_URL);
+		// Wait for the fetch to land and the disk write to flush.
+		const deadline = Date.now() + 2000;
+		while (!mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-live") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		// Disk write is fire-and-forget; give it a moment.
+		await new Promise((r) => setTimeout(r, 100));
+
+		const text = await readFile(cachePath, "utf8");
+		const parsed = JSON.parse(text);
+		expect(parsed.schemaVersion).toBe(1);
+		expect(parsed.body.data[0].id).toBe("grok-live");
+		expect(parsed.fetchedAt).toBeGreaterThan(0);
+	});
+
+	it("ignores a corrupt cache file and falls back to the live fetch", async () => {
+		await mkdir(join(tmpDir, "cache", "pi-grok"), { recursive: true });
+		await writeFile(cachePath, "not-json", "utf8");
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 2000;
+		while (!mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-live") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-live")).toBe(true);
+	});
+
+	it("treats a stale cache as usable and flags it for refresh", async () => {
+		// Body is just past the 15-minute fresh TTL but inside the 7-day stale window.
+		const stale = {
+			schemaVersion: 1,
+			fetchedAt: Date.now() - 20 * 60 * 1000,
+			body: { data: [{ id: "grok-stale-from-disk", context_length: 100_000 }] },
+		};
+		await mkdir(join(tmpDir, "cache", "pi-grok"), { recursive: true });
+		await writeFile(cachePath, JSON.stringify(stale), "utf8");
+
+		// Hold the network fetch so the stale disk body stays visible.
+		let _resolveLive: (r: Response) => void = () => {};
+		const held = new Promise<Response>((r) => { _resolveLive = r; });
+		globalThis.fetch = vi.fn(async () => held) as typeof fetch;
+
+		triggerDiscovery("token", CLI_PROXY_URL);
+		const deadline = Date.now() + 1000;
+		while (!mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-stale-from-disk") && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
+		expect(mergeDiscoveredModels(FALLBACK_MODELS).some((m) => m.id === "grok-stale-from-disk")).toBe(true);
+		expect(discoveryStatus().lastError).toMatch(/stale|refreshing/i);
+
+		_resolveLive(new Response(JSON.stringify({ data: [{ id: "grok-live" }] }), {
+			status: 200, headers: { "Content-Type": "application/json" },
+		}));
+	});
+});

@@ -32,6 +32,8 @@ kipselc             # 同上的快捷 shell 函数（定义在 ~/.bashrc.pi）
 
 手机 / 浏览器一端要能连到本机 bridge：要么走 PiPilot 的 P2P 信令，要么与 9377 端口同处 Tailscale / 局域网。这部分配置在 `~/Projects/pi_pilot/bridge/config.json`。
 
+> **PiPilot 源仓库**：[ccch1mneyyy/pi_pilot](https://github.com/ccch1mneyyy/pi_pilot)（原 `CikeSeven/pi_pilot`，MIT © CikeSeven）。独立二进制发行在本组织镜像仓 [pashippercode/pi-pilot](https://github.com/pashippercode/pi-pilot)，`kipsel-bridge` 在源码目录缺失时会自动从这里拉取（见下文回退链）。
+
 ## 工作流安全生产
 
 写权限随相位收放，由 `workflow-audit` 扩展在工具层强制执行。日常长任务走 `/work`：它一进入就把相位强制拉回 `plan`，连续任务被切成五个相位。
@@ -104,6 +106,7 @@ subagent({ chain: [{agent, task}, {agent, task}] })          // 串行，后一�
 - **只收自己启的**：手动或用 systemd 启的 bridge 不归 `kipsel` 管，退出时不会去动它。
 - **引用计数**：多个 `kipsel` 会话共用同一个 bridge，最后一个退出时才关。
 - **降级不阻断**：bridge 目录缺失、依赖没装、启动失败，都不影响 grok-pi 本体启动——TUI 是主，桥是辅。
+- **来源回退**：优先用源码树（`KIPSEL_BRIDGE_DIR` + `npm install`）；不可用时自动回退到独立二进制（镜像仓 [pashippercode/pi-pilot](https://github.com/pashippercode/pi-pilot) 的 Release 资产，sha256 校验后缓存到 `$XDG_DATA_HOME/kipsel/pipilot-bridge`；`KIPSEL_BRIDGE_NO_DOWNLOAD=1` 可关）。
 
 停止时按**进程组**终止。`npm start` 会派生出 `npm → sh → tsx → node` 四层，只杀 launcher 会留下孤儿继续占着 9377，所以这里整组回收。
 
@@ -119,7 +122,7 @@ cp launcher/kipsel launcher/kipsel-bridge ~/.local/bin/
 chmod +x ~/.local/bin/kipsel ~/.local/bin/kipsel-bridge
 ```
 
-前提：Node 22+、`grok-pi` 二进制、以及 `~/Projects/pi_pilot/bridge` 已 `npm install`。任一项缺失时 `kipsel` 仍能启动 TUI。
+前提：Node 22+、`grok-pi` 二进制。`~/Projects/pi_pilot/bridge` + `npm install` 是 bridge 的首选来源；目录缺失时自动回退独立二进制（首次运行会从 Release 下载，约 126 MB）。任一项缺失时 `kipsel` 仍能启动 TUI。
 
 可覆盖的环境变量：
 
@@ -128,11 +131,15 @@ chmod +x ~/.local/bin/kipsel ~/.local/bin/kipsel-bridge
 | `KIPSEL_BRIDGE_DIR` | `~/Projects/pi_pilot/bridge` |
 | `KIPSEL_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/kipsel` |
 | `PIPILOT_PORT` | `9377` |
+| `KIPSEL_BRIDGE_BIN` | `$XDG_DATA_HOME/kipsel/pipilot-bridge` |
+| `KIPSEL_BRIDGE_URL` | pashippercode/pi-pilot Release 资产 |
+| `KIPSEL_BRIDGE_SHA256` | 与上述资产一致的 sha256 |
+| `KIPSEL_BRIDGE_NO_DOWNLOAD=1` | 禁用自动下载 |
 | `KIPSEL_NO_BRIDGE=1` | 完全不管 bridge |
 
 ### pi 定制层
 
-`pi-fork/` 是 `~/.pi/agent` 的发行包（extensions / prompts / agents / themes / knowledge），提供上面的相位门控、六个专职代理与主题：
+`pi-fork/` 是 `~/.pi/agent` 的发行包（extensions / prompts / agents / themes / knowledge），提供上面的相位门控、六个专职代理与主题，并**内置 pi-grok 扩展**（源仓库 [stnly/pi-grok](https://github.com/stnly/pi-grok)，MIT © stnly，vendored at `pi-fork/agent/extensions/pi-grok/`，在 pi 里用 xAI SuperGrok OAuth 订阅直连 grok 模型）：
 
 ```bash
 cd pi-fork
@@ -157,7 +164,7 @@ docs/                    文档与存档
 ## 验证
 
 ```bash
-bash launcher/test-bridge-lifecycle.sh    # 21 项：单例/引用计数/外部不误杀/降级/孤儿回收/收尾自清理
+bash launcher/test-bridge-lifecycle.sh    # 单例/引用计数/外部不误杀/降级/二进制回退/孤儿回收/收尾自清理
 ```
 
 `pi-fork/` 的验证方式见 `pi-fork/README.md`。
