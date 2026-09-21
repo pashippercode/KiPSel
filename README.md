@@ -20,7 +20,7 @@ kipsel ──▶ pi 内核 ─┤
                     └─ web  ── PiPilot —— 手机 / 浏览器镜像同一会话
 ```
 
-`kipsel` 启动 grok-pi。grok-pi 内部用 `pi --mode rpc` 驱动同一个 pi 内核，PiPilot relay 在这个 RPC 会话里把自己注册成一个 desktop source，于是手机端看到的会话、工具调用、审批弹窗，和终端里的是同一份状态，而不是另起一个会话去猜。
+`kipsel` 启动 grok-pi。grok-pi 内部用 `pi --mode rpc` 驱动同一个 pi 内核，PiPilot relay 在这个 RPC 会话里把自己注册成一个 desktop source，于是手机端看到的会话、工具调用、审批弹窗，和终端里的是同一份状态。
 
 RPC 模式提供完整且 dialog-capable 的 ui 契约：`confirm` / `select` / `input` / `notify` / `setStatus` 都会转发给宿主。relay 因此能在 `rpc` 与 `tui` 两种形态下一致工作，包括把桌面上的审批弹窗转发到手机、失败时回落本地。
 
@@ -30,9 +30,9 @@ kipsel --continue   # 继续上一个会话
 kipselc             # 同上的快捷 shell 函数（定义在 ~/.bashrc.pi）
 ```
 
-手机 / 浏览器一端要能连到本机 bridge：要么走 PiPilot 的 P2P 信令，要么与 9377 端口同处 Tailscale / 局域网。这部分配置在 `~/Projects/pi_pilot/bridge/config.json`。
+手机 / 浏览器一端要能连到本机 bridge：要么走 PiPilot 的 P2P 信令，要么与 9377 端口同处 Tailscale / 局域网。源码树部署时这部分配置在 `~/Projects/pi_pilot/bridge/config.json`。
 
-> **PiPilot 源仓库**：[ccch1mneyyy/pi_pilot](https://github.com/ccch1mneyyy/pi_pilot)（原 `CikeSeven/pi_pilot`，MIT © CikeSeven）。独立二进制发行在本组织镜像仓 [pashippercode/pi-pilot](https://github.com/pashippercode/pi-pilot)，`kipsel-bridge` 在源码目录缺失时会自动从这里拉取（见下文回退链）。
+> **PiPilot 源仓库**：[ccch1mneyyy/pi_pilot](https://github.com/ccch1mneyyy/pi_pilot)（原 `CikeSeven/pi_pilot`，MIT © CikeSeven）；本组织发行镜像：[pashippercode/pi-pilot](https://github.com/pashippercode/pi-pilot)。
 
 ## 工作流安全生产
 
@@ -84,7 +84,7 @@ subagent({ chain: [{agent, task}, {agent, task}] })          // 串行，后一�
 
 ### 后台作业
 
-`background: true` 让子代理脱离当前轮次运行，立即返回 job id，完成时以 follow-up 回传；`subagent_jobs` 查状态与摘要，`subagent_cancel` 取消。默认是前台（`false`）——只有当你不需要本轮就拿到结果时才值得后台化。
+`background: true` 让子代理脱离当前轮次运行，立即返回 job id，完成时以 follow-up 回传；`subagent_jobs` 查状态与摘要，`subagent_cancel` 取消。默认前台；只有不需要本轮拿到结果时才值得后台化。
 
 ### 回传通道
 
@@ -100,13 +100,13 @@ subagent({ chain: [{agent, task}, {agent, task}] })          // 串行，后一�
 
 ## bridge 生命周期安全
 
-`kipsel` 同时管一个 PiPilot bridge，它按四条规则约束自己：
+`kipsel` 同时管一个 PiPilot bridge，它按五条规则约束自己：
 
 - **单例**：全局只有一个 bridge。已有就复用，绝不重复起。
 - **只收自己启的**：手动或用 systemd 启的 bridge 不归 `kipsel` 管，退出时不会去动它。
 - **引用计数**：多个 `kipsel` 会话共用同一个 bridge，最后一个退出时才关。
 - **降级不阻断**：bridge 目录缺失、依赖没装、启动失败，都不影响 grok-pi 本体启动——TUI 是主，桥是辅。
-- **来源回退**：优先用源码树（`KIPSEL_BRIDGE_DIR` + `npm install`）；不可用时自动回退到独立二进制（镜像仓 [pashippercode/pi-pilot](https://github.com/pashippercode/pi-pilot) 的 Release 资产，sha256 校验后缓存到 `$XDG_DATA_HOME/kipsel/pipilot-bridge`；`KIPSEL_BRIDGE_NO_DOWNLOAD=1` 可关）。
+- **来源回退**：bridge 源码树不可用时自动回退到独立二进制，下载后经 sha256 校验方才入缓存；开关与路径见「安装」节的变量表。
 
 停止时按**进程组**终止。`npm start` 会派生出 `npm → sh → tsx → node` 四层，只杀 launcher 会留下孤儿继续占着 9377，所以这里整组回收。
 
@@ -122,7 +122,7 @@ cp launcher/kipsel launcher/kipsel-bridge ~/.local/bin/
 chmod +x ~/.local/bin/kipsel ~/.local/bin/kipsel-bridge
 ```
 
-前提：Node 22+、`grok-pi` 二进制。`~/Projects/pi_pilot/bridge` + `npm install` 是 bridge 的首选来源；目录缺失时自动回退独立二进制（首次运行会从 Release 下载，约 126 MB）。任一项缺失时 `kipsel` 仍能启动 TUI。
+前提：Node 22+、`grok-pi` 二进制。bridge 首选源码树（`~/Projects/pi_pilot/bridge` 下 `npm install`），目录缺失时首次运行会自动下载独立二进制（约 126 MB）。任一项缺失时 `kipsel` 仍能启动 TUI。
 
 可覆盖的环境变量：
 
@@ -143,7 +143,7 @@ chmod +x ~/.local/bin/kipsel ~/.local/bin/kipsel-bridge
 
 ```bash
 cd pi-fork
-./install.sh            # 增量：extensions/prompts/agents 覆盖，knowledge/settings if-missing
+./install.sh            # 增量：extensions/prompts/agents/AGENTS.md/APPEND_SYSTEM.md/keybindings.json 覆盖，knowledge/settings if-missing
 ./install.sh --force    # 全量覆盖（会覆盖 knowledge/，先确认备份）
 ./install.sh --dry-run
 ```
